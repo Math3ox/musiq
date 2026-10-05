@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=musiq
+GenericName=Lecteur de musique
+Comment=Musique du PC et de Jellyfin, en mode terminal
+Icon=musiq
+Exec=konsole --hide-menubar --hide-tabbar -p tabtitle=musiq -e musiq
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=musique;music;jellyfin;lecteur;

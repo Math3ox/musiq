@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Le CD de musiq : vu de trois quarts, incliné, deux reflets opposés. -->
+  <defs>
+    <clipPath id="disque"><ellipse cx="64" cy="64" rx="58" ry="26"/></clipPath>
+  </defs>
+  <g transform="rotate(-17 64 64)">
+    <ellipse cx="64" cy="64" rx="58" ry="26" fill="#3a3c44"/>
+    <g clip-path="url(#disque)"><g transform="translate(64 64) scale(1 0.4483)">
+      <path d="M0 0 L58 0 A58 58 0 0 1 41 41 Z" fill="#e8a283"/>
+      <path d="M0 0 L41 41 A58 58 0 0 1 0 58 Z" fill="#8a6a62"/>
+      <path d="M0 0 L-58 0 A58 58 0 0 1 -41 -41 Z" fill="#e8a283"/>
+      <path d="M0 0 L-41 -41 A58 58 0 0 1 0 -58 Z" fill="#8a6a62"/>
+    </g></g>
+    <ellipse cx="64" cy="64" rx="58" ry="26" fill="none" stroke="#9698a0" stroke-width="5"/>
+    <ellipse cx="64" cy="64" rx="21" ry="9.4" fill="#5f6169"/>
+    <ellipse cx="64" cy="64" rx="10" ry="4.5" fill="#1d1e22" stroke="#9698a0" stroke-width="3"/>
+  </g>
+</svg>
