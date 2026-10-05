@@ -34,6 +34,13 @@ pub struct Config {
     /// Qualité réduite (Opus 128 kb/s, converti par le serveur) pour écouter hors de chez soi.
     #[serde(default)]
     pub mobile_quality: bool,
+    /// Égaliseur : actif ou non, gains des 10 bandes (dB), nom du préréglage.
+    #[serde(default)]
+    pub eq_enabled: bool,
+    #[serde(default = "default_eq")]
+    pub eq_gains: Vec<f64>,
+    #[serde(default = "default_eq_preset")]
+    pub eq_preset: String,
     /// Fichier d'où vient cette configuration, et où elle est réenregistrée.
     #[serde(skip)]
     pub file: PathBuf,
@@ -45,6 +52,14 @@ fn default_dirs() -> Vec<PathBuf> {
 
 fn default_label() -> String {
     "Jellyfin".into()
+}
+
+fn default_eq() -> Vec<f64> {
+    vec![0.0; 10]
+}
+
+fn default_eq_preset() -> String {
+    "Plat".into()
 }
 
 fn default_replaygain() -> String {
@@ -68,6 +83,9 @@ impl Default for Config {
             volume: default_volume(),
             replaygain: default_replaygain(),
             mobile_quality: false,
+            eq_enabled: false,
+            eq_gains: default_eq(),
+            eq_preset: default_eq_preset(),
             file: PathBuf::new(),
         }
     }
@@ -134,6 +152,9 @@ impl Config {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         c.file = p.to_path_buf();
+        // Fichier modifié à la main : toujours 10 bandes, dans la plage permise.
+        c.eq_gains.resize(10, 0.0);
+        c.eq_gains.iter_mut().for_each(|g| *g = crate::eq::clamp(*g));
         if c.device_id.is_empty() {
             c.device_id = random_hex(16);
         }

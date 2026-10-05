@@ -1,6 +1,7 @@
 //! État de l'application : arbre des sources, liste de titres, file de lecture, saisies.
 
 use crate::config::{Config, Rng, Session};
+use crate::eq;
 use crate::jellyfin::{self, ApiError, Entry, Jellyfin, Report};
 use crate::local;
 use crate::model::{Source, Track};
@@ -100,6 +101,10 @@ pub enum Mode {
     Search(String),
     /// Filtre de la liste affichée, appliqué au fil de la frappe.
     Filter,
+    /// Égaliseur ouvert, bande sélectionnée.
+    Eq { band: usize },
+    /// Liste de toutes les touches.
+    Help,
 }
 
 /// Ce que montre le panneau de droite : il change la réaction à Entrée.
@@ -152,7 +157,14 @@ pub struct App {
     pub quit: bool,
     rng: Rng,
     session_file: PathBuf,
+    /// La chaîne de l'égaliseur est en place dans mpv (on peut la régler à chaud).
+    eq_live: bool,
+    /// Description de la chaîne telle que mpv la connaît. Les réglages à chaud ne
+    /// la modifient pas : si mpv la reconstruisait (changement de format audio),
+    /// il reprendrait ces valeurs. On la resynchronise en fermant l'égaliseur.
+    eq_graph: Option<String>,
     // Zones mémorisées au rendu, pour savoir où l'on clique.
+    pub area_eq_bars: Vec<Rect>,
     pub area_side: Rect,
     pub area_tracks: Rect,
     pub area_player: Rect,
@@ -196,6 +208,7 @@ impl App {
             Ok(p) => app.player = Some(p),
             Err(e) => app.flash(e),
         }
+        app.apply_eq(None);
         app.resume();
         if !app.cfg.logged_in() {
             app.flash("Pas encore connecté à Jellyfin : appuie sur c");
@@ -241,6 +254,9 @@ impl App {
             quit: false,
             rng: Rng::new(),
             session_file: PathBuf::new(),
+            eq_live: false,
+            eq_graph: None,
+            area_eq_bars: Vec::new(),
             area_side: Rect::default(),
             area_tracks: Rect::default(),
             area_player: Rect::default(),
@@ -834,6 +850,111 @@ impl App {
         }
     }
 
+    // ── Égaliseur ───────────────────────────────────────────────────────────
+
+    pub fn eq_active(&self) -> bool {
+        self.cfg.eq_enabled && !eq::is_flat(&self.cfg.eq_gains)
+    }
+
+    /// Transmet les réglages à mpv au moindre coût : rien à plat, la chaîne
+    /// entière seulement à l'activation, sinon la bande modifiée (ou toutes,
+    /// avec None) et le préampli, à chaud.
+    fn apply_eq(&mut self, band: Option<usize>) {
+        let want = self.eq_active();
+        let gains = self.cfg.eq_gains.clone();
+        let Some(p) = self.player.as_mut() else { return };
+        if !want {
+            if self.eq_live {
+                p.set_eq(None);
+                self.eq_live = false;
+                self.eq_graph = None;
+            }
+            return;
+        }
+        if !self.eq_live {
+            self.eq_graph = eq::filter(&gains);
+            p.set_eq(self.eq_graph.as_deref());
+            self.eq_live = true;
+            return;
+        }
+        match band {
+            Some(i) => p.eq_band(i, gains[i]),
+            None => gains.iter().enumerate().for_each(|(i, &g)| p.eq_band(i, g)),
+        }
+        p.eq_preamp(eq::preamp(&gains));
+    }
+
+    /// Règle une bande (arrondie au dB). Toucher un réglage active l'égaliseur.
+    fn set_gain(&mut self, band: usize, gain: f64) {
+        let Some(g) = self.cfg.eq_gains.get_mut(band) else { return };
+        *g = eq::clamp(gain.round());
+        self.cfg.eq_preset = eq::preset_name(&self.cfg.eq_gains).into();
+        self.cfg.eq_enabled = true;
+        self.apply_eq(Some(band));
+    }
+
+    fn eq_preset(&mut self, delta: isize) {
+        let (name, gains) = eq::cycle(&self.cfg.eq_preset, delta);
+        self.cfg.eq_gains = gains.to_vec();
+        self.cfg.eq_preset = name.into();
+        self.cfg.eq_enabled = true;
+        self.apply_eq(None);
+    }
+
+    fn eq_toggle(&mut self) {
+        self.cfg.eq_enabled = !self.cfg.eq_enabled;
+        self.apply_eq(None);
+    }
+
+    fn key_eq(&mut self, k: KeyEvent) {
+        let Mode::Eq { band } = self.mode else { return };
+        let g = self.cfg.eq_gains.get(band).copied().unwrap_or(0.0);
+        match k.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('E' | 'é' | 'q') => self.close_eq(),
+            KeyCode::Left => self.mode = Mode::Eq { band: band.saturating_sub(1) },
+            KeyCode::Right => self.mode = Mode::Eq { band: (band + 1).min(eq::BANDS.len() - 1) },
+            KeyCode::Up => self.set_gain(band, g + 1.0),
+            KeyCode::Down => self.set_gain(band, g - 1.0),
+            KeyCode::PageUp => self.set_gain(band, g + 3.0),
+            KeyCode::PageDown => self.set_gain(band, g - 3.0),
+            KeyCode::Char('0') => self.set_gain(band, 0.0),
+            KeyCode::Char('p') => self.eq_preset(1),
+            KeyCode::Char('P') => self.eq_preset(-1),
+            KeyCode::Char('o') => self.eq_toggle(),
+            KeyCode::Char(' ') => self.toggle_pause(),
+            _ => {}
+        }
+    }
+
+    /// Fermeture : on enregistre, et mpv reçoit une seule fois la chaîne à jour.
+    fn close_eq(&mut self) {
+        self.mode = Mode::Normal;
+        let _ = self.cfg.save();
+        let want = eq::filter(&self.cfg.eq_gains);
+        if self.eq_live && want != self.eq_graph {
+            if let Some(p) = self.player.as_mut() {
+                p.set_eq(want.as_deref());
+            }
+            self.eq_graph = want;
+        }
+    }
+
+    /// Souris dans l'égaliseur : clic ou glisser sur une barre, molette pour ±1 dB.
+    fn mouse_eq(&mut self, m: MouseEvent) {
+        let pos = Position::new(m.column, m.row);
+        let Some(band) = self.area_eq_bars.iter().position(|r| r.contains(pos)) else { return };
+        self.mode = Mode::Eq { band };
+        let g = self.cfg.eq_gains[band];
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
+                self.set_gain(band, gain_at(self.area_eq_bars[band], m.row));
+            }
+            MouseEventKind::ScrollUp => self.set_gain(band, g + 1.0),
+            MouseEventKind::ScrollDown => self.set_gain(band, g - 1.0),
+            _ => {}
+        }
+    }
+
     // ── Suivi des écoutes côté Jellyfin ─────────────────────────────────────
 
     fn report(&mut self, step: Report) {
@@ -1046,6 +1167,11 @@ impl App {
             Mode::Login(_) => return self.key_login(k),
             Mode::Search(_) => return self.key_search(k),
             Mode::Filter => return self.key_filter(k),
+            Mode::Eq { .. } => return self.key_eq(k),
+            Mode::Help => {
+                self.mode = Mode::Normal; // n'importe quelle touche referme l'aide
+                return;
+            }
             Mode::Normal => {}
         }
         match k.code {
@@ -1059,6 +1185,8 @@ impl App {
             KeyCode::Char('-') => self.add_volume(-5.0),
             KeyCode::Char('s') => self.toggle_shuffle(),
             KeyCode::Char('m') => self.toggle_mobile(),
+            KeyCode::Char('E' | 'é') => self.mode = Mode::Eq { band: 0 },
+            KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('/') => self.mode = Mode::Search(String::new()),
             KeyCode::Char('f') => {
                 self.mode = Mode::Filter;
@@ -1227,6 +1355,15 @@ impl App {
     // ── Souris ──────────────────────────────────────────────────────────────
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        if matches!(self.mode, Mode::Eq { .. }) {
+            return self.mouse_eq(m);
+        }
+        if matches!(self.mode, Mode::Help) {
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                self.mode = Mode::Normal;
+            }
+            return;
+        }
         if !matches!(self.mode, Mode::Normal) {
             return;
         }
@@ -1275,6 +1412,14 @@ fn field(f: &mut LoginForm) -> &mut String {
         1 => &mut f.user,
         _ => &mut f.pw,
     }
+}
+
+/// Gain (dB) correspondant à la ligne `y` d'une barre de l'égaliseur : le haut
+/// vaut +12, la ligne du milieu 0, le bas -12.
+fn gain_at(bar: Rect, y: u16) -> f64 {
+    let half = (bar.height / 2).max(1) as f64;
+    let mid = bar.y + bar.height / 2;
+    eq::clamp((mid as f64 - y as f64) / half * eq::MAX_DB)
 }
 
 /// Index de l'élément sous la souris dans une liste encadrée.
@@ -1656,5 +1801,53 @@ mod tests {
         assert!(a.target(&t).unwrap().contains("static=true"));
         a.on_key(KeyEvent::from(KeyCode::Char('s')));
         assert!(a.shuffle);
+    }
+
+    #[test]
+    fn egaliseur_au_clavier() {
+        let (mut a, _) = app(false);
+        let touche = |a: &mut App, c: KeyCode| a.on_key(KeyEvent::from(c));
+        touche(&mut a, KeyCode::Char('é'));
+        assert!(matches!(a.mode, Mode::Eq { band: 0 }));
+        assert!(!a.eq_active(), "à plat : rien n'est appliqué");
+        touche(&mut a, KeyCode::Right);
+        touche(&mut a, KeyCode::Up);
+        touche(&mut a, KeyCode::PageUp);
+        assert_eq!(a.cfg.eq_gains[1], 4.0);
+        assert!(a.cfg.eq_enabled && a.eq_active(), "toucher un réglage active l'égaliseur");
+        assert_eq!(a.cfg.eq_preset, eq::CUSTOM);
+        for _ in 0..10 {
+            touche(&mut a, KeyCode::PageUp);
+        }
+        assert_eq!(a.cfg.eq_gains[1], eq::MAX_DB, "borné à +12 dB");
+        touche(&mut a, KeyCode::Char('0'));
+        assert_eq!(a.cfg.eq_gains[1], 0.0);
+        assert_eq!(a.cfg.eq_preset, "Plat", "tout à zéro : reconnu comme le préréglage Plat");
+        touche(&mut a, KeyCode::Char('p'));
+        assert_eq!((a.cfg.eq_preset.as_str(), a.cfg.eq_gains[0]), ("Graves", 6.0));
+        touche(&mut a, KeyCode::Char('o'));
+        assert!(!a.eq_active(), "« o » coupe sans perdre les réglages");
+        assert_eq!(a.cfg.eq_gains[0], 6.0);
+        touche(&mut a, KeyCode::Esc);
+        assert!(matches!(a.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn egaliseur_a_la_souris() {
+        let (mut a, _) = app(false);
+        a.mode = Mode::Eq { band: 0 };
+        a.area_eq_bars = (0..10).map(|i| Rect::new(10 + i * 4, 5, 2, 9)).collect();
+        let clic = |col, row, kind| MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE };
+        a.on_mouse(clic(22, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(matches!(a.mode, Mode::Eq { band: 3 }));
+        assert_eq!(a.cfg.eq_gains[3], 12.0, "haut de la barre = +12 dB");
+        a.on_mouse(clic(22, 13, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(a.cfg.eq_gains[3], -12.0, "bas de la barre = -12 dB");
+        a.on_mouse(clic(22, 9, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(a.cfg.eq_gains[3], 0.0, "milieu = 0 dB");
+        a.on_mouse(clic(22, 9, MouseEventKind::ScrollUp));
+        assert_eq!(a.cfg.eq_gains[3], 1.0);
+        a.on_mouse(clic(0, 0, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(a.cfg.eq_gains[3], 1.0, "hors des barres : rien ne change");
     }
 }

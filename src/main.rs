@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod disc;
+mod eq;
 mod jellyfin;
 mod local;
 mod model;

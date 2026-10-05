@@ -15,8 +15,12 @@ ses reflets s'allument secteur par secteur.
 - Enchaînement **sans blanc** entre les titres, **volume homogène**
   (ReplayGain), **file d'attente**, reprise là où on s'était arrêté, et
   remontée des écoutes vers Jellyfin.
+- **Égaliseur 10 bandes** avec préréglages, réglable à chaud sans coupure.
+- Interface qui s'adapte à la taille de la fenêtre : colonnes masquées,
+  panneau compact, commandes repliées sur plusieurs lignes (**?** les liste toutes).
 - Léger : ≈ 3 Mo de mémoire pour l'interface (mpv ≈ 35 Mo pour le son),
-  aucun réveil ni redessin quand la lecture est en pause.
+  aucun réveil ni redessin quand la lecture est en pause ; l'égaliseur actif
+  coûte moins de 0,1 % de CPU, et rien du tout quand il est coupé.
 
 ## Prérequis
 
@@ -68,6 +72,7 @@ Le fichier de configuration est créé au premier lancement :
 | `volume` | volume au démarrage, en % | `50` |
 | `replaygain` | égalisation du volume : `track`, `album` ou `no` | `track` |
 | `mobile_quality` | qualité réduite (Opus 128 kb/s), basculable avec **m** | `false` |
+| `eq_enabled`, `eq_gains`, `eq_preset` | égaliseur (réglé depuis **E**) | coupé, à plat |
 | `user_name`, `user_id`, `token` | session Jellyfin, remplis à la connexion | — |
 
 Seul un **jeton de session** Jellyfin est enregistré, jamais le mot de passe.
@@ -97,6 +102,8 @@ endroit, en pause.
 | s | lecture aléatoire |
 | / | rechercher (serveur + PC) — Entrée sur un résultat le glisse dans la file en cours |
 | m | qualité mobile / qualité d'origine |
+| E (ou é) | égaliseur : ←→ bande, ↑↓ ±1 dB, p préréglage, o activer/couper, 0 remise à zéro ; clic ou glisser sur une barre |
+| ? | liste de toutes les touches |
 | c | se connecter à Jellyfin |
 | q | quitter |
 

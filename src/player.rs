@@ -144,6 +144,20 @@ impl Player {
         }
     }
 
+    /// Pose (ou retire, avec None) toute la chaîne de l'égaliseur.
+    pub fn set_eq(&mut self, filter: Option<&str>) {
+        self.cmd(json!(["set_property", "af", filter.unwrap_or("")]));
+    }
+
+    /// Règle une bande de l'égaliseur déjà en place, sans couper le son.
+    pub fn eq_band(&mut self, band: usize, gain: f64) {
+        self.cmd(json!(["af-command", "eq", "g", format!("{gain:.1}"), format!("equalizer@b{band}")]));
+    }
+
+    pub fn eq_preamp(&mut self, db: f64) {
+        self.cmd(json!(["af-command", "eq", "volume", format!("{db:.1}dB"), "volume@pre"]));
+    }
+
     /// mpv vient d'enchaîner sur le titre préchargé : on oublie celui d'avant.
     pub fn drop_finished(&mut self) {
         self.cmd(json!(["playlist-remove", 0]));
