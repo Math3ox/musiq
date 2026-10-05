@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -28,6 +28,9 @@ pub struct Config {
     /// Volume au démarrage (en %). Ce que l'on règle pendant l'écoute n'est pas retenu.
     #[serde(default = "default_volume")]
     pub volume: f64,
+    /// Fichier d'où vient cette configuration, et où elle est réenregistrée.
+    #[serde(skip)]
+    pub file: PathBuf,
 }
 
 fn default_dirs() -> Vec<PathBuf> {
@@ -53,6 +56,7 @@ impl Default for Config {
             device_id: String::new(),
             local_dirs: default_dirs(),
             volume: default_volume(),
+            file: PathBuf::new(),
         }
     }
 }
@@ -70,19 +74,33 @@ fn path() -> PathBuf {
 
 impl Config {
     pub fn load() -> Config {
-        let mut c: Config = fs::read_to_string(path())
+        Self::load_from(&path())
+    }
+
+    pub fn save(&self) -> io::Result<()> {
+        if self.file.as_os_str().is_empty() {
+            return Err(io::Error::other("aucun fichier de configuration"));
+        }
+        self.save_to(&self.file)
+    }
+
+    /// Fichier absent ou illisible : configuration par défaut.
+    pub fn load_from(p: &Path) -> Config {
+        let mut c: Config = fs::read_to_string(p)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        c.file = p.to_path_buf();
         if c.device_id.is_empty() {
             c.device_id = random_hex(16);
         }
         c
     }
 
-    pub fn save(&self) -> io::Result<()> {
-        let p = path();
-        fs::create_dir_all(p.parent().unwrap())?;
+    pub fn save_to(&self, p: &Path) -> io::Result<()> {
+        if let Some(dir) = p.parent() {
+            fs::create_dir_all(dir)?;
+        }
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -90,7 +108,7 @@ impl Config {
             .mode(0o600)
             .open(&p)?;
         // mode() ne joue qu'à la création : on resserre aussi un fichier existant.
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(p, fs::Permissions::from_mode(0o600))?;
         let s = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
         f.write_all(s.as_bytes())
     }
@@ -113,6 +131,11 @@ impl Rng {
         Rng(t ^ ((std::process::id() as u64) << 32) | 1)
     }
 
+    #[cfg(test)]
+    pub fn with_seed(seed: u64) -> Rng {
+        Rng(seed | 1)
+    }
+
     pub fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
@@ -130,4 +153,84 @@ impl Rng {
 fn random_hex(bytes: usize) -> String {
     let mut r = Rng::new();
     (0..bytes).map(|_| format!("{:02x}", r.next() as u8)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("musiq-cfg-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        p.join("config.json")
+    }
+
+    fn mode(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn aller_retour_en_droits_600() {
+        let p = tmp("aller-retour");
+        let mut c = Config::load_from(&p);
+        c.token = "jeton".into();
+        c.user_id = "u1".into();
+        c.volume = 30.0;
+        c.save().unwrap();
+        assert_eq!(mode(&p), 0o600);
+        let l = Config::load_from(&p);
+        assert_eq!((l.token.as_str(), l.user_id.as_str(), l.volume), ("jeton", "u1", 30.0));
+        assert_eq!(l.device_id, c.device_id, "l'identifiant d'appareil reste stable");
+        assert!(l.logged_in());
+        fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn fichier_trop_ouvert_est_resserre() {
+        let p = tmp("droits");
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, "{}").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        Config::load_from(&p).save().unwrap();
+        assert_eq!(mode(&p), 0o600);
+        fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn ancienne_config_complete_par_defaut() {
+        let p = tmp("ancienne");
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, r#"{"jellyfin_url":"http://x:8096","token":"t"}"#).unwrap();
+        let c = Config::load_from(&p);
+        assert_eq!(c.jellyfin_url, "http://x:8096");
+        assert_eq!(c.server_label, "Jellyfin");
+        assert_eq!(c.volume, 50.0);
+        assert_eq!(c.local_dirs, [home().join("Musique")]);
+        assert_eq!(c.device_id.len(), 32);
+        assert!(!c.logged_in(), "un jeton sans utilisateur ne suffit pas");
+        fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn fichier_absent_ou_corrompu_donne_les_valeurs_par_defaut() {
+        let p = tmp("corrompu");
+        assert!(Config::load_from(&p).jellyfin_url.is_empty());
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, "pas du json {").unwrap();
+        let c = Config::load_from(&p);
+        assert_eq!((c.volume, c.server_label.as_str()), (50.0, "Jellyfin"));
+        fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sans_fichier_on_n_ecrit_nulle_part() {
+        assert!(Config::default().save().is_err());
+    }
+
+    #[test]
+    fn hasard_dans_les_bornes() {
+        let mut r = Rng::with_seed(3);
+        assert!((0..1000).all(|_| r.below(7) < 7));
+        assert_eq!(r.below(0), 0);
+    }
 }

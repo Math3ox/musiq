@@ -7,6 +7,7 @@ mod jellyfin;
 mod local;
 mod model;
 mod player;
+mod queue;
 mod ui;
 
 use app::{App, Msg};

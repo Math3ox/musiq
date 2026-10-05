@@ -28,6 +28,9 @@ ses reflets s'allument secteur par secteur.
 
 Puis lancer `musiq`.
 
+Tests : `cargo test` (aucun serveur ni mpv requis : un faux serveur Jellyfin
+est lancé en local).
+
 ## Configurer
 
 Rien à modifier dans le code. Au premier lancement :

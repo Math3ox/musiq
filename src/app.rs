@@ -1,10 +1,11 @@
 //! État de l'application : arbre des sources, liste de titres, file de lecture, saisies.
 
 use crate::config::{Config, Rng};
-use crate::jellyfin::{self, Entry, Jellyfin};
+use crate::jellyfin::{self, ApiError, Entry, Jellyfin};
 use crate::local;
 use crate::model::{Source, Track};
 use crate::player::{self, Player};
+use crate::queue::Queue;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{ListState, TableState};
@@ -18,8 +19,8 @@ const SECTOR_STEP: f64 = 0.11;
 
 pub enum Msg {
     Player(player::Event),
-    Children { path: Vec<usize>, result: Result<Vec<Node>, String> },
-    Tracks { req: u64, title: String, result: Result<Vec<Track>, String> },
+    Children { path: Vec<usize>, result: Result<Vec<Node>, ApiError> },
+    Tracks { req: u64, title: String, result: Result<Vec<Track>, ApiError> },
     Login(Result<(String, String), String>),
 }
 
@@ -104,9 +105,9 @@ pub struct App {
     pub focus: Focus,
     pub mode: Mode,
     player: Option<Player>,
-    queue: Vec<Track>,
-    qidx: usize,
-    history: Vec<usize>,
+    queue: Queue<Track>,
+    /// Titres illisibles d'affilée : au-delà de 3, on arrête au lieu de défiler toute la file.
+    errors: u32,
     pub now: Option<Track>,
     pub pos: f64,
     pub dur: f64,
@@ -153,8 +154,22 @@ fn step(sel: Option<usize>, len: usize, delta: isize) -> Option<usize> {
 impl App {
     pub fn new(cfg: Config, tx: Sender<Msg>) -> App {
         let volume = cfg.volume;
+        let mut app = App::build(cfg, tx.clone());
+        match Player::start(tx, volume) {
+            Ok(p) => app.player = Some(p),
+            Err(e) => app.flash(e),
+        }
+        if !app.cfg.logged_in() {
+            app.flash("Pas encore connecté à Jellyfin : appuie sur c");
+        }
+        app
+    }
+
+    /// L'application sans lecteur audio (mpv est lancé par `new`) : sert aussi aux tests.
+    fn build(cfg: Config, tx: Sender<Msg>) -> App {
+        let volume = cfg.volume;
         let mut app = App {
-            tx: tx.clone(),
+            tx,
             tree: Vec::new(),
             rows: Vec::new(),
             side: ListState::default(),
@@ -166,9 +181,8 @@ impl App {
             focus: Focus::Sidebar,
             mode: Mode::Normal,
             player: None,
-            queue: Vec::new(),
-            qidx: 0,
-            history: Vec::new(),
+            queue: Queue::default(),
+            errors: 0,
             now: None,
             pos: 0.0,
             dur: 0.0,
@@ -201,14 +215,6 @@ impl App {
         app.tree = vec![pc, server];
         app.side.select(Some(0));
         app.rebuild_rows();
-
-        match Player::start(tx, volume) {
-            Ok(p) => app.player = Some(p),
-            Err(e) => app.flash(e),
-        }
-        if !app.cfg.logged_in() {
-            app.flash("Pas encore connecté à Jellyfin : appuie sur c");
-        }
         app
     }
 
@@ -436,13 +442,13 @@ impl App {
     // ── Lecture ─────────────────────────────────────────────────────────────
 
     fn play_from(&mut self, i: usize) {
-        self.queue = self.tracks.clone();
-        self.history.clear();
-        self.play_index(i);
+        self.queue = Queue::new(self.tracks.clone(), i);
+        self.errors = 0;
+        self.play_current();
     }
 
-    fn play_index(&mut self, i: usize) {
-        let Some(t) = self.queue.get(i).cloned() else { return };
+    fn play_current(&mut self) {
+        let Some(t) = self.queue.current().cloned() else { return };
         let target = match &t.source {
             Source::Local(p) => p.to_string_lossy().into_owned(),
             Source::Jelly(id) => match self.jelly() {
@@ -454,7 +460,6 @@ impl App {
             return self.flash("mpv n'est pas lancé : impossible de lire");
         };
         p.load(&target);
-        self.qidx = i;
         self.pos = 0.0;
         self.dur = t.duration.unwrap_or(0.0);
         self.paused = false;
@@ -462,29 +467,24 @@ impl App {
     }
 
     fn next(&mut self) {
-        if self.queue.is_empty() || self.now.is_none() {
+        if self.now.is_none() {
             return;
         }
-        let n = self.queue.len();
-        let i = if self.shuffle && n > 1 {
-            let mut j = self.qidx;
-            while j == self.qidx {
-                j = self.rng.below(n);
-            }
-            j
-        } else if self.qidx + 1 < n {
-            self.qidx + 1
+        if self.queue.next(self.shuffle, &mut self.rng).is_some() {
+            self.play_current();
         } else {
-            if let Some(p) = self.player.as_mut() {
-                p.stop();
-            }
-            self.now = None;
-            self.pos = 0.0;
-            self.dur = 0.0;
-            return self.flash("Fin de la file de lecture");
-        };
-        self.history.push(self.qidx);
-        self.play_index(i);
+            self.stop("Fin de la file de lecture");
+        }
+    }
+
+    fn stop(&mut self, msg: &str) {
+        if let Some(p) = self.player.as_mut() {
+            p.stop();
+        }
+        self.now = None;
+        self.pos = 0.0;
+        self.dur = 0.0;
+        self.flash(msg);
     }
 
     fn prev(&mut self) {
@@ -492,10 +492,8 @@ impl App {
             if let Some(p) = self.player.as_mut() {
                 p.seek_percent(0.0);
             }
-        } else if let Some(i) = self.history.pop() {
-            self.play_index(i);
-        } else if self.qidx > 0 && !self.queue.is_empty() {
-            self.play_index(self.qidx - 1);
+        } else if self.queue.prev().is_some() {
+            self.play_current();
         }
     }
 
@@ -525,6 +523,32 @@ impl App {
     }
 
     // ── Connexion ───────────────────────────────────────────────────────────
+
+    /// Jellyfin a refusé le jeton : on l'oublie et on propose tout de suite de se reconnecter.
+    fn session_expired(&mut self) {
+        self.cfg.token.clear();
+        let ch = self.server_children();
+        if let Some(server) = self.tree.get_mut(1) {
+            server.children = Some(ch);
+            server.expanded = true;
+        }
+        self.rebuild_rows();
+        self.tracks_loading = false;
+        if matches!(self.mode, Mode::Login(_)) {
+            return; // formulaire déjà ouvert : on ne perd pas la saisie en cours
+        }
+        self.open_login();
+        if let Mode::Login(f) = &mut self.mode {
+            f.error = Some("Session expirée : reconnecte-toi.".into());
+        }
+    }
+
+    fn api_error(&mut self, e: ApiError) {
+        match e {
+            ApiError::Unauthorized => self.session_expired(),
+            ApiError::Other(msg) => self.flash(msg),
+        }
+    }
 
     fn need_login(&mut self) {
         self.flash("Pas connecté à Jellyfin : appuie sur c");
@@ -564,18 +588,31 @@ impl App {
     pub fn on_msg(&mut self, msg: Msg) {
         match msg {
             Msg::Player(e) => match e {
-                player::Event::Time(t) => self.pos = t,
+                player::Event::Time(t) => {
+                    self.pos = t;
+                    if t > 0.5 {
+                        self.errors = 0;
+                    }
+                }
                 player::Event::Duration(d) => self.dur = d,
                 player::Event::Pause(p) => self.paused = p,
                 player::Event::Volume(v) => self.volume = v,
                 player::Event::Eof => self.next(),
                 player::Event::Error(e) => {
-                    self.flash(format!("Lecture impossible : {e}"));
-                    self.next();
+                    self.errors += 1;
+                    if self.errors >= 3 {
+                        self.errors = 0;
+                        self.stop(&format!("3 titres illisibles d'affilée, lecture arrêtée ({e})"));
+                    } else {
+                        self.flash(format!("Lecture impossible : {e}"));
+                        self.next();
+                    }
                 }
             },
             Msg::Children { path, result } => {
-                let err = match self.node_mut(&path) {
+                // Le nœud doit toujours attendre ce résultat : l'arbre a pu être
+                // reconstruit entre-temps (reconnexion), et le chemin viser autre chose.
+                let err = match self.node_mut(&path).filter(|n| n.loading) {
                     Some(n) => {
                         n.loading = false;
                         match result {
@@ -591,10 +628,10 @@ impl App {
                     }
                     None => None,
                 };
-                if let Some(e) = err {
-                    self.flash(e);
-                }
                 self.rebuild_rows();
+                if let Some(e) = err {
+                    self.api_error(e);
+                }
             }
             Msg::Tracks { req, title, result } => {
                 if req != self.req {
@@ -604,7 +641,7 @@ impl App {
                     Ok(t) => self.set_tracks(title, t),
                     Err(e) => {
                         self.tracks_loading = false;
-                        self.flash(e);
+                        self.api_error(e);
                     }
                 }
             }
@@ -854,4 +891,195 @@ fn row_at(area: Rect, y: u16, top: u16, offset: usize, len: usize) -> Option<usi
     }
     let i = offset + (y - first) as usize;
     (i < len).then_some(i)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn app(logged: bool) -> (App, mpsc::Receiver<Msg>) {
+        let mut c = Config::default();
+        c.local_dirs = Vec::new();
+        if logged {
+            c.jellyfin_url = "http://127.0.0.1:9".into();
+            c.user_name = "moi".into();
+            c.user_id = "u".into();
+            c.token = "t".into();
+        }
+        let (tx, rx) = mpsc::channel();
+        (App::build(c, tx), rx)
+    }
+
+    fn labels(a: &App) -> Vec<String> {
+        a.rows.iter().map(|r| a.node(&r.path).unwrap().label.clone()).collect()
+    }
+
+    fn track(n: &str) -> Track {
+        Track {
+            title: n.into(),
+            artist: String::new(),
+            album: String::new(),
+            duration: None,
+            source: Source::Local(PathBuf::from(n)),
+        }
+    }
+
+    fn login_form(a: &App) -> &LoginForm {
+        match &a.mode {
+            Mode::Login(f) => f,
+            _ => panic!("le formulaire de connexion devrait être ouvert"),
+        }
+    }
+
+    #[test]
+    fn arbre_selon_la_connexion() {
+        assert_eq!(labels(&app(false).0), ["Ce PC", "Jellyfin", "Se connecter…"]);
+        assert_eq!(labels(&app(true).0), ["Ce PC", "Jellyfin", "Playlists", "Artistes", "Albums"]);
+    }
+
+    #[test]
+    fn session_expiree_propose_de_se_reconnecter() {
+        let (mut a, _) = app(true);
+        a.req = 5;
+        a.tracks_loading = true;
+        a.on_msg(Msg::Tracks { req: 5, title: "B.Rap".into(), result: Err(ApiError::Unauthorized) });
+
+        assert!(a.cfg.token.is_empty(), "le jeton refusé est oublié");
+        assert!(!a.tracks_loading);
+        assert_eq!(labels(&a)[2], "Se connecter…");
+        let f = login_form(&a);
+        assert_eq!((f.user.as_str(), f.field), ("moi", 2), "curseur directement sur le mot de passe");
+        assert!(f.error.as_deref().unwrap().contains("Session expirée"));
+    }
+
+    #[test]
+    fn deuxieme_refus_ne_perd_pas_la_saisie() {
+        let (mut a, _) = app(true);
+        a.session_expired();
+        if let Mode::Login(f) = &mut a.mode {
+            f.pw = "en cours".into();
+        }
+        a.on_msg(Msg::Tracks { req: a.req, title: String::new(), result: Err(ApiError::Unauthorized) });
+        assert_eq!(login_form(&a).pw, "en cours");
+    }
+
+    #[test]
+    fn reconnexion_restaure_le_serveur() {
+        let (mut a, _) = app(true);
+        let dir = std::env::temp_dir().join(format!("musiq-app-{}", std::process::id()));
+        a.cfg.file = dir.join("config.json");
+        a.session_expired();
+        a.on_msg(Msg::Login(Ok(("nouveau".into(), "u2".into()))));
+
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!((a.cfg.token.as_str(), a.cfg.user_id.as_str()), ("nouveau", "u2"));
+        assert_eq!(labels(&a)[2..], ["Playlists", "Artistes", "Albums"]);
+        assert_eq!(Config::load_from(&a.cfg.file).token, "nouveau", "la nouvelle session est enregistrée");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mauvais_mot_de_passe_reste_dans_le_formulaire() {
+        let (mut a, _) = app(false);
+        a.open_login();
+        a.on_msg(Msg::Login(Err("Identifiant ou mot de passe incorrect".into())));
+        let f = login_form(&a);
+        assert!(!f.busy);
+        assert_eq!(f.error.as_deref(), Some("Identifiant ou mot de passe incorrect"));
+    }
+
+    #[test]
+    fn adresse_invalide_refusee_sans_bloquer_le_formulaire() {
+        let (mut a, _) = app(false);
+        a.open_login();
+        a.submit_login();
+        let f = login_form(&a);
+        assert!(!f.busy, "on peut corriger et réessayer");
+        assert!(f.error.as_deref().unwrap().contains("Adresse du serveur"));
+    }
+
+    #[test]
+    fn autre_erreur_affichee_sans_deconnecter() {
+        let (mut a, _) = app(true);
+        a.on_msg(Msg::Tracks { req: a.req, title: String::new(), result: Err(ApiError::Other("HTTP 500".into())) });
+        assert_eq!(a.cfg.token, "t");
+        assert!(matches!(a.mode, Mode::Normal));
+        assert!(a.status.as_ref().unwrap().0.contains("500"));
+    }
+
+    #[test]
+    fn resultat_d_une_ancienne_demande_ignore() {
+        let (mut a, _) = app(true);
+        a.req = 2;
+        a.on_msg(Msg::Tracks { req: 1, title: "vieux".into(), result: Ok(vec![track("x")]) });
+        assert!(a.tracks.is_empty());
+        a.on_msg(Msg::Tracks { req: 2, title: "récent".into(), result: Ok(vec![track("y")]) });
+        assert_eq!((a.tracks_title.as_str(), a.tracks.len()), ("récent", 1));
+    }
+
+    #[test]
+    fn enfants_charges_puis_resultat_perime_ignore() {
+        let (mut a, _) = app(true);
+        let playlists = [1, 0];
+        a.node_mut(&playlists).unwrap().loading = true;
+        a.node_mut(&playlists).unwrap().expanded = true;
+        let pl = |n: &str| Node::new(n, Kind::Playlist(n.into()));
+        a.on_msg(Msg::Children { path: playlists.to_vec(), result: Ok(vec![pl("B.Rap"), pl("Chill")]) });
+        assert_eq!(labels(&a)[3..5], ["B.Rap", "Chill"]);
+
+        // Pendant un chargement, la session expire et l'arbre est reconstruit :
+        // le même chemin désigne désormais « Se connecter… ».
+        a.node_mut(&[1, 1]).unwrap().loading = true;
+        a.session_expired();
+        a.on_msg(Msg::Children { path: vec![1, 0], result: Ok(vec![pl("intrus")]) });
+        assert!(a.node(&[1, 0]).unwrap().children.is_none());
+        assert_eq!(labels(&a), ["Ce PC", "Jellyfin", "Se connecter…"]);
+    }
+
+    #[test]
+    fn trois_titres_illisibles_arretent_la_lecture() {
+        let (mut a, _) = app(false);
+        a.queue = Queue::new((0..10).map(|i| track(&i.to_string())).collect(), 0);
+        a.now = Some(track("0"));
+        for _ in 0..2 {
+            a.on_msg(Msg::Player(player::Event::Error("fichier absent".into())));
+            assert!(a.now.is_some());
+        }
+        a.on_msg(Msg::Player(player::Event::Error("fichier absent".into())));
+        assert!(a.now.is_none());
+        assert!(a.status.as_ref().unwrap().0.starts_with("3 titres illisibles"));
+    }
+
+    #[test]
+    fn une_lecture_reussie_remet_le_compteur_a_zero() {
+        let (mut a, _) = app(false);
+        a.queue = Queue::new((0..10).map(|i| track(&i.to_string())).collect(), 0);
+        a.now = Some(track("0"));
+        a.on_msg(Msg::Player(player::Event::Error("x".into())));
+        a.on_msg(Msg::Player(player::Event::Error("x".into())));
+        a.on_msg(Msg::Player(player::Event::Time(12.0)));
+        a.on_msg(Msg::Player(player::Event::Error("x".into())));
+        assert!(a.now.is_some());
+    }
+
+    #[test]
+    fn deplacement_borne() {
+        assert_eq!(step(None, 0, 1), None);
+        assert_eq!(step(None, 5, 1), Some(1));
+        assert_eq!(step(Some(4), 5, 1), Some(4));
+        assert_eq!(step(Some(1), 5, -10), Some(0));
+        assert_eq!(step(Some(5), 5, 0), Some(4));
+    }
+
+    #[test]
+    fn clic_sur_une_ligne() {
+        let zone = Rect::new(0, 10, 30, 8); // bordure en y=10 et y=17
+        assert_eq!(row_at(zone, 10, 1, 0, 50), None, "bordure du haut");
+        assert_eq!(row_at(zone, 11, 1, 0, 50), Some(0));
+        assert_eq!(row_at(zone, 13, 1, 20, 50), Some(22), "décalage du défilement");
+        assert_eq!(row_at(zone, 17, 1, 0, 50), None, "bordure du bas");
+        assert_eq!(row_at(zone, 12, 2, 0, 50), Some(0), "ligne d'en-tête du tableau");
+        assert_eq!(row_at(zone, 15, 1, 0, 3), None, "sous le dernier élément");
+    }
 }

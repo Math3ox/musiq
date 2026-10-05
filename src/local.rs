@@ -83,3 +83,98 @@ fn track(root: &Path, file: &Path) -> Track {
         source: Source::Local(file.to_path_buf()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dossier temporaire supprimé à la fin du test.
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(name: &str) -> Tmp {
+            let p = std::env::temp_dir().join(format!("musiq-test-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            Tmp(p)
+        }
+
+        fn file(&self, rel: &str) {
+            let f = self.0.join(rel);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, b"").unwrap();
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn titles(t: &[Track]) -> Vec<&str> {
+        t.iter().map(|t| t.title.as_str()).collect()
+    }
+
+    #[test]
+    fn reconnait_les_extensions_audio() {
+        assert!(is_audio(Path::new("a.FLAC")));
+        assert!(is_audio(Path::new("x/b.mp3")));
+        assert!(is_audio(Path::new("c.opus")));
+        assert!(!is_audio(Path::new("cover.jpg")));
+        assert!(!is_audio(Path::new("sans_extension")));
+    }
+
+    #[test]
+    fn liste_triee_sans_fichiers_caches_ni_autres_fichiers() {
+        let t = Tmp::new("liste");
+        for f in ["B/x.mp3", "A/y.mp3", "2.flac", "1.mp3", "cover.jpg", ".cache.mp3", ".cache/z.mp3"] {
+            t.file(f);
+        }
+        let (dirs, tracks) = list(&t.0, &t.0);
+        let names: Vec<_> = dirs.iter().map(|d| d.file_name().unwrap().to_str().unwrap()).collect();
+        assert_eq!(names, ["A", "B"]);
+        assert_eq!(titles(&tracks), ["1", "2"]);
+    }
+
+    #[test]
+    fn deduit_artiste_et_album_des_dossiers() {
+        let t = Tmp::new("tags");
+        t.file("Daft Punk/Discovery/01 One More Time.flac");
+        t.file("Discovery/02 Aerodynamic.mp3");
+        t.file("seul.mp3");
+
+        let (_, a) = list(&t.0, &t.0.join("Daft Punk/Discovery"));
+        assert_eq!((a[0].title.as_str(), a[0].artist.as_str(), a[0].album.as_str()),
+                   ("01 One More Time", "Daft Punk", "Discovery"));
+        assert_eq!(a[0].source, Source::Local(t.0.join("Daft Punk/Discovery/01 One More Time.flac")));
+
+        let (_, b) = list(&t.0, &t.0.join("Discovery"));
+        assert_eq!((b[0].artist.as_str(), b[0].album.as_str()), ("", "Discovery"));
+
+        let (_, c) = list(&t.0, &t.0);
+        assert_eq!((c[0].artist.as_str(), c[0].album.as_str()), ("", ""));
+    }
+
+    #[test]
+    fn recherche_insensible_a_la_casse_et_limitee() {
+        let t = Tmp::new("recherche");
+        for f in ["Jul/Album/Tchikita.mp3", "Jul/Album/Autre.mp3", "PNL/Deux frères/Au DD.flac", "PNL/notes.txt"] {
+            t.file(f);
+        }
+        let roots = [t.0.clone()];
+        assert_eq!(search(&roots, "jul", 10).len(), 2, "le nom du dossier compte aussi");
+        assert_eq!(titles(&search(&roots, "au dd", 10)), ["Au DD"]);
+        assert_eq!(search(&roots, "jul", 1).len(), 1);
+        assert!(search(&roots, "notes", 10).is_empty(), "seulement les fichiers audio");
+        assert!(search(&roots, "introuvable", 10).is_empty());
+    }
+
+    #[test]
+    fn dossier_absent_ne_plante_pas() {
+        let absent = Path::new("/nexiste/vraiment/pas");
+        let (dirs, tracks) = list(absent, absent);
+        assert!(dirs.is_empty() && tracks.is_empty());
+        assert!(search(&[absent.to_path_buf()], "x", 10).is_empty());
+    }
+}
