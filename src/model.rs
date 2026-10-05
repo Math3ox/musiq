@@ -1,13 +1,14 @@
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Source {
     Local(PathBuf),
     /// Identifiant d'élément Jellyfin.
     Jelly(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Track {
     pub title: String,
     pub artist: String,

@@ -1,6 +1,6 @@
 //! Dessin de l'interface (ratatui).
 
-use crate::app::{App, Focus, Kind, LoginForm, Mode};
+use crate::app::{App, Focus, Kind, LoginForm, Mode, View};
 use crate::disc::{Disc, SECTORS};
 use crate::model::fmt_time;
 use ratatui::prelude::*;
@@ -58,7 +58,7 @@ fn draw_side(f: &mut Frame, app: &mut App, area: Rect) {
                 "▸ "
             };
             let style = match &n.kind {
-                Kind::PcRoot | Kind::ServerRoot => Style::new().bold(),
+                Kind::PcRoot | Kind::ServerRoot | Kind::Queue => Style::new().bold(),
                 Kind::Login => Style::new().fg(ACCENT).italic(),
                 _ => Style::new(),
             };
@@ -66,6 +66,13 @@ fn draw_side(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::raw(" ".repeat(r.depth * 2 + 1)),
                 Span::styled(marker, Style::new().fg(DIM)),
                 Span::styled(n.label.clone(), style),
+                Span::styled(
+                    match n.kind {
+                        Kind::Queue if app.queue_len() > 0 => format!("  {}", app.queue_len()),
+                        _ => String::new(),
+                    },
+                    Style::new().fg(DIM),
+                ),
             ]))
         })
         .collect();
@@ -80,13 +87,19 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect) {
         "Titres".to_string()
     } else if app.tracks_loading {
         format!("{} · chargement…", app.tracks_title)
-    } else {
+    } else if app.filter.is_empty() {
         format!("{} · {} titres", app.tracks_title, app.tracks.len())
+    } else {
+        format!("{} · filtre « {} » : {} / {}", app.tracks_title, app.filter, app.view.len(), app.tracks.len())
     };
     let block = panel(title, focused);
-    if app.tracks.is_empty() {
+    if app.view.is_empty() {
         let msg = if app.tracks_loading {
             "Chargement…"
+        } else if !app.tracks.is_empty() {
+            "Aucun titre ne correspond au filtre (Échap pour l'effacer)."
+        } else if app.shown == View::Queue {
+            "La file est vide : « a » ajoute un titre, « e » le place juste après celui en cours."
         } else if app.tracks_title.is_empty() {
             "Choisis une playlist, un album ou un dossier à gauche."
         } else {
@@ -98,9 +111,9 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let playing = app.now.as_ref().map(|t| t.source.clone());
     let rows: Vec<Row> = app
-        .tracks
+        .view
         .iter()
-        .enumerate()
+        .map(|&i| (i, &app.tracks[i]))
         .map(|(i, t)| {
             let is_now = playing.as_ref() == Some(&t.source);
             let num = match (is_now, app.paused) {
@@ -180,6 +193,9 @@ fn draw_player(f: &mut Frame, app: &mut App, area: Rect) {
     app.area_gauge = gauge_area;
 
     let mut status = vec![Span::styled(format!("   vol {:.0} %", app.volume), Style::new().fg(DIM))];
+    if app.cfg.mobile_quality {
+        status.push(Span::styled("   ·   qualité mobile", Style::new().fg(ACCENT)));
+    }
     if app.shuffle {
         status.push(Span::styled("   ·   aléatoire", Style::new().fg(ACCENT)));
     }
@@ -199,7 +215,14 @@ fn hints(list: &[(&str, &str)]) -> Line<'static> {
 }
 
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
-    let line = if let Mode::Search(q) = &app.mode {
+    let line = if let Mode::Filter = &app.mode {
+        Line::from(vec![
+            Span::styled(" Filtrer : ", Style::new().fg(ACCENT).bold()),
+            Span::raw(app.filter.clone()),
+            Span::styled("▌", Style::new().fg(ACCENT)),
+            Span::styled("     Entrée garder · Échap effacer", Style::new().fg(DIM)),
+        ])
+    } else if let Mode::Search(q) = &app.mode {
         Line::from(vec![
             Span::styled(" Rechercher : ", Style::new().fg(ACCENT).bold()),
             Span::raw(q.clone()),
@@ -211,7 +234,16 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     } else {
         let mut h: Vec<(&str, &str)> = match app.focus {
             Focus::Sidebar => vec![("↑↓", "naviguer"), ("→ Entrée", "ouvrir"), ("←", "fermer")],
-            Focus::Tracks => vec![("↑↓", "naviguer"), ("Entrée", "lire"), ("←", "sources")],
+            Focus::Tracks if app.shown == View::Queue => {
+                vec![("↑↓", "naviguer"), ("Entrée", "aller à"), ("Suppr", "retirer"), ("f", "filtrer")]
+            }
+            Focus::Tracks => vec![
+                ("↑↓", "naviguer"),
+                ("Entrée", "lire"),
+                ("a", "ajouter à la file"),
+                ("e", "lire ensuite"),
+                ("f", "filtrer"),
+            ],
             Focus::Player => vec![("←→", "±5 s"), ("↑↓", "volume")],
         };
         h.extend([
@@ -222,6 +254,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             ("s", "aléatoire"),
             ("/", "chercher"),
             ("Tab", "panneau"),
+            ("m", "qualité mobile"),
             ("c", "connexion"),
             ("q", "quitter"),
         ]);

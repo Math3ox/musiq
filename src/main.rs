@@ -11,15 +11,25 @@ mod queue;
 mod ui;
 
 use app::{App, Msg};
-use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
 use ratatui::crossterm::execute;
 use std::io;
-use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread;
 
 fn main() -> io::Result<()> {
     let cfg = config::Config::load();
     let (tx, rx) = mpsc::channel();
+    // Clavier et souris arrivent par le même canal que mpv et le réseau :
+    // la boucle principale peut dormir tant que rien ne se passe.
+    let input = tx.clone();
+    thread::spawn(move || {
+        while let Ok(e) = event::read() {
+            if input.send(Msg::Input(e)).is_err() {
+                break;
+            }
+        }
+    });
     let mut terminal = ratatui::init();
     execute!(io::stdout(), EnableMouseCapture)?;
     let mut app = App::new(cfg, tx);
@@ -31,25 +41,32 @@ fn main() -> io::Result<()> {
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<Msg>) -> io::Result<()> {
+    let mut dirty = true;
     while !app.quit {
-        terminal.draw(|f| ui::draw(f, app))?;
-        if event::poll(Duration::from_millis(100))? {
-            // On vide tout ce qui est en attente avant de redessiner.
-            loop {
-                match event::read()? {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
-                    Event::Mouse(m) => app.on_mouse(m),
-                    _ => {}
-                }
-                if app.quit || !event::poll(Duration::ZERO)? {
-                    break;
-                }
+        if dirty {
+            terminal.draw(|f| ui::draw(f, app))?;
+            dirty = false;
+        }
+        // Attente jusqu'au prochain message, ou à la prochaine échéance (image du
+        // CD, effacement d'un message). En pause, sans échéance : on dort.
+        let first = match app.deadline() {
+            Some(d) => match rx.recv_timeout(d) {
+                Ok(m) => Some(m),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => break,
+            },
+        };
+        if let Some(m) = first {
+            dirty |= app.on_msg(m);
+            while let Ok(m) = rx.try_recv() {
+                dirty |= app.on_msg(m);
             }
         }
-        while let Ok(m) = rx.try_recv() {
-            app.on_msg(m);
-        }
-        app.tick();
+        dirty |= app.tick();
     }
     Ok(())
 }

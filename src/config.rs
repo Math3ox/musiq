@@ -28,6 +28,12 @@ pub struct Config {
     /// Volume au démarrage (en %). Ce que l'on règle pendant l'écoute n'est pas retenu.
     #[serde(default = "default_volume")]
     pub volume: f64,
+    /// Égalisation du volume entre les titres : "track", "album" ou "no".
+    #[serde(default = "default_replaygain")]
+    pub replaygain: String,
+    /// Qualité réduite (Opus 128 kb/s, converti par le serveur) pour écouter hors de chez soi.
+    #[serde(default)]
+    pub mobile_quality: bool,
     /// Fichier d'où vient cette configuration, et où elle est réenregistrée.
     #[serde(skip)]
     pub file: PathBuf,
@@ -39,6 +45,10 @@ fn default_dirs() -> Vec<PathBuf> {
 
 fn default_label() -> String {
     "Jellyfin".into()
+}
+
+fn default_replaygain() -> String {
+    "track".into()
 }
 
 fn default_volume() -> f64 {
@@ -56,6 +66,8 @@ impl Default for Config {
             device_id: String::new(),
             local_dirs: default_dirs(),
             volume: default_volume(),
+            replaygain: default_replaygain(),
+            mobile_quality: false,
             file: PathBuf::new(),
         }
     }
@@ -63,6 +75,37 @@ impl Default for Config {
 
 pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+}
+
+/// Où l'on reprend au lancement : ~/.local/state/musiq/session.json.
+pub fn session_path() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".local").join("state"));
+    base.join("musiq").join("session.json")
+}
+
+/// File de lecture et position, enregistrées en quittant.
+#[derive(Serialize, Deserialize, Default)]
+pub struct Session {
+    pub title: String,
+    pub queue: Vec<crate::model::Track>,
+    pub index: usize,
+    pub position: f64,
+}
+
+impl Session {
+    pub fn load(p: &Path) -> Option<Session> {
+        let s: Session = serde_json::from_str(&fs::read_to_string(p).ok()?).ok()?;
+        (!s.queue.is_empty()).then_some(s)
+    }
+
+    pub fn save(&self, p: &Path) -> io::Result<()> {
+        if let Some(dir) = p.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::write(p, serde_json::to_string(self).map_err(io::Error::other)?)
+    }
 }
 
 fn path() -> PathBuf {
@@ -220,6 +263,32 @@ mod tests {
         let c = Config::load_from(&p);
         assert_eq!((c.volume, c.server_label.as_str()), (50.0, "Jellyfin"));
         fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn session_aller_retour() {
+        let p = tmp("session");
+        let t = crate::model::Track {
+            title: "Tchikita".into(),
+            artist: "Jul".into(),
+            album: String::new(),
+            duration: Some(221.0),
+            source: crate::model::Source::Jelly("t1".into()),
+        };
+        let s = Session { title: "B.Rap".into(), queue: vec![t.clone(), t], index: 1, position: 42.5 };
+        s.save(&p).unwrap();
+        let l = Session::load(&p).unwrap();
+        assert_eq!((l.title.as_str(), l.queue.len(), l.index, l.position), ("B.Rap", 2, 1, 42.5));
+        assert_eq!(l.queue[0].source, crate::model::Source::Jelly("t1".into()));
+        Session::default().save(&p).unwrap();
+        assert!(Session::load(&p).is_none(), "une file vide ne se reprend pas");
+        fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn nouveaux_reglages_par_defaut() {
+        let c = Config::default();
+        assert_eq!((c.replaygain.as_str(), c.mobile_quality), ("track", false));
     }
 
     #[test]

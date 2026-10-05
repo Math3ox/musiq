@@ -1,12 +1,14 @@
 //! État de l'application : arbre des sources, liste de titres, file de lecture, saisies.
 
-use crate::config::{Config, Rng};
-use crate::jellyfin::{self, ApiError, Entry, Jellyfin};
+use crate::config::{Config, Rng, Session};
+use crate::jellyfin::{self, ApiError, Entry, Jellyfin, Report};
 use crate::local;
 use crate::model::{Source, Track};
 use crate::player::{self, Player};
 use crate::queue::Queue;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{ListState, TableState};
 use std::path::{Path, PathBuf};
@@ -16,8 +18,14 @@ use std::time::{Duration, Instant};
 
 /// Durée d'affichage d'un secteur du CD : l'animation avance par crans.
 const SECTOR_STEP: f64 = 0.11;
+/// Un message d'état reste affiché ce temps-là.
+const STATUS_LIFE: Duration = Duration::from_secs(5);
+/// Fréquence de la remontée « en cours d'écoute » vers Jellyfin.
+const REPORT_EVERY: Duration = Duration::from_secs(10);
 
 pub enum Msg {
+    /// Clavier, souris, redimensionnement : lus par un fil dédié.
+    Input(Event),
     Player(player::Event),
     Children { path: Vec<usize>, result: Result<Vec<Node>, ApiError> },
     Tracks { req: u64, title: String, result: Result<Vec<Track>, ApiError> },
@@ -32,6 +40,7 @@ impl From<player::Event> for Msg {
 
 #[derive(Clone)]
 pub enum Kind {
+    Queue,
     PcRoot,
     Dir { root: PathBuf, path: PathBuf },
     ServerRoot,
@@ -59,7 +68,7 @@ impl Node {
     }
 
     pub fn expandable(&self) -> bool {
-        !matches!(self.kind, Kind::Playlist(_) | Kind::Album(_) | Kind::Login)
+        !matches!(self.kind, Kind::Playlist(_) | Kind::Album(_) | Kind::Login | Kind::Queue)
     }
 }
 
@@ -89,6 +98,16 @@ pub enum Mode {
     Normal,
     Login(LoginForm),
     Search(String),
+    /// Filtre de la liste affichée, appliqué au fil de la frappe.
+    Filter,
+}
+
+/// Ce que montre le panneau de droite : il change la réaction à Entrée.
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum View {
+    List,
+    Search,
+    Queue,
 }
 
 pub struct App {
@@ -98,14 +117,23 @@ pub struct App {
     pub rows: Vec<Row>,
     pub side: ListState,
     pub tracks: Vec<Track>,
+    /// Indices de `tracks` visibles avec le filtre ; la sélection du tableau s'y réfère.
+    pub view: Vec<usize>,
+    pub filter: String,
     pub tracks_title: String,
     pub tracks_loading: bool,
+    pub shown: View,
     pub table: TableState,
     req: u64,
     pub focus: Focus,
     pub mode: Mode,
     player: Option<Player>,
     queue: Queue<Track>,
+    queue_title: String,
+    /// Le titre prévu a bien été confié à mpv (enchaînement sans blanc possible).
+    upcoming_sent: bool,
+    /// mpv a un fichier chargé (faux après une reprise sans serveur, par exemple).
+    loaded: bool,
     /// Titres illisibles d'affilée : au-delà de 3, on arrête au lieu de défiler toute la file.
     errors: u32,
     pub now: Option<Track>,
@@ -117,9 +145,13 @@ pub struct App {
     /// Avancée de l'animation du CD, en secteurs (ne progresse qu'en lecture).
     pub spin: f64,
     last_tick: Instant,
+    /// Titre Jellyfin signalé « en cours » au serveur, et date de la dernière remontée.
+    reported: Option<String>,
+    last_report: Instant,
     pub status: Option<(String, Instant)>,
     pub quit: bool,
     rng: Rng,
+    session_file: PathBuf,
     // Zones mémorisées au rendu, pour savoir où l'on clique.
     pub area_side: Rect,
     pub area_tracks: Rect,
@@ -151,21 +183,27 @@ fn step(sel: Option<usize>, len: usize, delta: isize) -> Option<usize> {
     Some(i.clamp(0, len as isize - 1) as usize)
 }
 
+fn matches(t: &Track, q: &str) -> bool {
+    [&t.title, &t.artist, &t.album].iter().any(|f| f.to_lowercase().contains(q))
+}
+
 impl App {
     pub fn new(cfg: Config, tx: Sender<Msg>) -> App {
-        let volume = cfg.volume;
+        let (volume, replaygain) = (cfg.volume, cfg.replaygain.clone());
         let mut app = App::build(cfg, tx.clone());
-        match Player::start(tx, volume) {
+        app.session_file = crate::config::session_path();
+        match Player::start(tx, volume, &replaygain) {
             Ok(p) => app.player = Some(p),
             Err(e) => app.flash(e),
         }
+        app.resume();
         if !app.cfg.logged_in() {
             app.flash("Pas encore connecté à Jellyfin : appuie sur c");
         }
         app
     }
 
-    /// L'application sans lecteur audio (mpv est lancé par `new`) : sert aussi aux tests.
+    /// L'application sans lecteur audio ni session (mpv est lancé par `new`) : sert aussi aux tests.
     fn build(cfg: Config, tx: Sender<Msg>) -> App {
         let volume = cfg.volume;
         let mut app = App {
@@ -174,14 +212,20 @@ impl App {
             rows: Vec::new(),
             side: ListState::default(),
             tracks: Vec::new(),
+            view: Vec::new(),
+            filter: String::new(),
             tracks_title: String::new(),
             tracks_loading: false,
+            shown: View::List,
             table: TableState::default(),
             req: 0,
             focus: Focus::Sidebar,
             mode: Mode::Normal,
             player: None,
             queue: Queue::default(),
+            queue_title: String::new(),
+            upcoming_sent: false,
+            loaded: false,
             errors: 0,
             now: None,
             pos: 0.0,
@@ -191,9 +235,12 @@ impl App {
             shuffle: false,
             spin: 0.0,
             last_tick: Instant::now(),
+            reported: None,
+            last_report: Instant::now(),
             status: None,
             quit: false,
             rng: Rng::new(),
+            session_file: PathBuf::new(),
             area_side: Rect::default(),
             area_tracks: Rect::default(),
             area_player: Rect::default(),
@@ -212,30 +259,99 @@ impl App {
         let mut server = Node::new(app.cfg.server_label.clone(), Kind::ServerRoot);
         server.children = Some(app.server_children());
         server.expanded = true;
-        app.tree = vec![pc, server];
-        app.side.select(Some(0));
+        app.tree = vec![Node::new("File d'attente", Kind::Queue), pc, server];
+        app.side.select(Some(1));
         app.rebuild_rows();
         app
     }
 
     pub fn shutdown(&mut self) {
+        // En quittant, la remontée de fin d'écoute se fait tout de suite (délai court).
+        if let (Some(id), Some(j)) = (self.reported.take(), self.jelly()) {
+            let _ = j.report(Report::Stop, &id, self.pos, self.paused, self.cfg.mobile_quality);
+        }
         self.player = None;
         let _ = self.cfg.save();
+        if !self.session_file.as_os_str().is_empty() {
+            let s = Session {
+                title: self.queue_title.clone(),
+                queue: self.queue.items().to_vec(),
+                index: self.queue.index(),
+                position: if self.now.is_some() { self.pos } else { 0.0 },
+            };
+            let _ = s.save(&self.session_file);
+        }
+    }
+
+    /// Reprend la file et la position de la dernière fois, en pause.
+    fn resume(&mut self) {
+        let Some(s) = Session::load(&self.session_file) else { return };
+        self.queue = Queue::new(s.queue, s.index);
+        self.queue_title = s.title;
+        let Some(t) = self.queue.current().cloned() else { return };
+        self.dur = t.duration.unwrap_or(0.0);
+        self.pos = s.position;
+        self.now = Some(t);
+        self.paused = true;
+        self.load_resumed();
+        self.show_queue();
+    }
+
+    /// Charge le titre courant en pause, à la position retenue. Faux si impossible.
+    fn load_resumed(&mut self) -> bool {
+        let Some(t) = self.now.clone() else { return false };
+        let Some(target) = self.target(&t) else { return false };
+        let Some(p) = self.player.as_mut() else { return false };
+        p.load_paused(&target, self.pos);
+        self.loaded = true;
+        self.plan_upcoming();
+        true
     }
 
     pub fn flash(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), Instant::now()));
     }
 
-    pub fn tick(&mut self) {
+    fn playing(&self) -> bool {
+        self.now.is_some() && !self.paused
+    }
+
+    /// Avance le temps (animation, messages, suivi). Vrai s'il faut redessiner.
+    pub fn tick(&mut self) -> bool {
         let dt = self.last_tick.elapsed().as_secs_f64();
         self.last_tick = Instant::now();
-        if self.now.is_some() && !self.paused {
+        let mut dirty = false;
+        if self.playing() {
+            let before = self.spin as u64;
             self.spin += dt / SECTOR_STEP;
+            dirty |= self.spin as u64 != before;
+            if self.reported.is_some() && self.last_report.elapsed() >= REPORT_EVERY {
+                self.report(Report::Progress);
+            }
         }
-        if self.status.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(5)) {
+        if self.status.as_ref().is_some_and(|(_, t)| t.elapsed() >= STATUS_LIFE) {
             self.status = None;
+            dirty = true;
         }
+        dirty
+    }
+
+    /// Délai avant la prochaine chose à faire sans intervention (None : rien, on attend).
+    /// C'est ce qui permet de ne rien redessiner ni réveiller en pause.
+    pub fn deadline(&self) -> Option<Duration> {
+        let mut next: Option<Duration> = None;
+        let mut at = |d: Duration| next = Some(next.map_or(d, |n| n.min(d)));
+        if self.playing() {
+            let frac = self.spin.fract();
+            at(Duration::from_secs_f64(((1.0 - frac) * SECTOR_STEP).max(0.005)));
+            if self.reported.is_some() {
+                at(REPORT_EVERY.saturating_sub(self.last_report.elapsed()));
+            }
+        }
+        if let Some((_, t)) = &self.status {
+            at(STATUS_LIFE.saturating_sub(t.elapsed()));
+        }
+        next
     }
 
     fn jelly(&self) -> Option<Jellyfin> {
@@ -245,6 +361,14 @@ impl App {
             user_id: self.cfg.user_id.clone(),
             device_id: self.cfg.device_id.clone(),
         })
+    }
+
+    /// Ce que mpv doit ouvrir pour ce titre (None : serveur requis mais pas connecté).
+    fn target(&self, t: &Track) -> Option<String> {
+        match &t.source {
+            Source::Local(p) => Some(p.to_string_lossy().into_owned()),
+            Source::Jelly(id) => self.jelly().map(|j| j.stream_url(id, self.cfg.mobile_quality)),
+        }
     }
 
     fn server_children(&self) -> Vec<Node> {
@@ -257,6 +381,19 @@ impl App {
         } else {
             vec![Node::new("Se connecter…", Kind::Login)]
         }
+    }
+
+    fn reset_server_node(&mut self) {
+        let ch = self.server_children();
+        if let Some(server) = self.tree.iter_mut().find(|n| matches!(n.kind, Kind::ServerRoot)) {
+            server.children = Some(ch);
+            server.expanded = true;
+        }
+        self.rebuild_rows();
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.queue.items().len()
     }
 
     // ── Arbre de gauche ─────────────────────────────────────────────────────
@@ -364,6 +501,12 @@ impl App {
         let Some(kind) = self.node(&path).map(|n| n.kind.clone()) else { return };
         match kind {
             Kind::Login => self.open_login(),
+            Kind::Queue => {
+                self.show_queue();
+                if focus_tracks {
+                    self.focus = Focus::Tracks;
+                }
+            }
             Kind::Playlist(_) | Kind::Album(_) => {
                 self.open_tracks(&path);
                 if focus_tracks {
@@ -380,12 +523,52 @@ impl App {
 
     // ── Liste de titres ─────────────────────────────────────────────────────
 
-    fn set_tracks(&mut self, title: String, tracks: Vec<Track>) {
-        self.table.select(if tracks.is_empty() { None } else { Some(0) });
-        *self.table.offset_mut() = 0;
+    fn set_tracks(&mut self, title: String, tracks: Vec<Track>, shown: View) {
         self.tracks = tracks;
         self.tracks_title = title;
         self.tracks_loading = false;
+        self.shown = shown;
+        self.filter.clear();
+        self.apply_filter();
+        self.table.select(if self.view.is_empty() { None } else { Some(0) });
+        *self.table.offset_mut() = 0;
+    }
+
+    /// Recalcule les lignes visibles d'après le filtre, en gardant si possible le même titre sélectionné.
+    fn apply_filter(&mut self) {
+        let keep = self.table.selected().and_then(|i| self.view.get(i)).copied();
+        let q = self.filter.to_lowercase();
+        self.view = (0..self.tracks.len()).filter(|&i| q.is_empty() || matches(&self.tracks[i], &q)).collect();
+        let sel = keep.and_then(|k| self.view.iter().position(|&i| i == k));
+        self.table.select(if self.view.is_empty() { None } else { Some(sel.unwrap_or(0)) });
+    }
+
+    /// Titre du tableau sous la sélection (ou à la ligne `i` de la vue).
+    fn view_track(&self, i: usize) -> Option<&Track> {
+        self.view.get(i).and_then(|&k| self.tracks.get(k))
+    }
+
+    fn show_queue(&mut self) {
+        let items = self.queue.items().to_vec();
+        let current = self.queue.index();
+        self.set_tracks("File d'attente".into(), items, View::Queue);
+        if !self.view.is_empty() {
+            self.table.select(Some(current.min(self.view.len() - 1)));
+        }
+    }
+
+    /// La file a changé : on met à jour son affichage si elle est à l'écran.
+    fn refresh_queue_view(&mut self) {
+        if self.shown != View::Queue {
+            return;
+        }
+        let (sel, filter) = (self.table.selected(), std::mem::take(&mut self.filter));
+        self.tracks = self.queue.items().to_vec();
+        self.filter = filter;
+        self.apply_filter();
+        if let Some(s) = sel {
+            self.table.select(step(Some(s), self.view.len(), 0));
+        }
     }
 
     fn open_tracks(&mut self, path: &[usize]) {
@@ -396,12 +579,11 @@ impl App {
         match kind {
             Kind::Dir { root, path: dir } => {
                 let (_, t) = local::list(&root, &dir);
-                self.set_tracks(label, t);
+                self.set_tracks(label, t, View::List);
             }
             Kind::Playlist(_) | Kind::Album(_) | Kind::Artist(_) => {
                 let Some(j) = self.jelly() else { return self.need_login() };
-                self.tracks.clear();
-                self.tracks_title = label.clone();
+                self.set_tracks(label.clone(), Vec::new(), View::List);
                 self.tracks_loading = true;
                 let tx = self.tx.clone();
                 thread::spawn(move || {
@@ -421,8 +603,7 @@ impl App {
     fn search(&mut self, q: String) {
         self.req += 1;
         let (req, tx, j, dirs) = (self.req, self.tx.clone(), self.jelly(), self.cfg.local_dirs.clone());
-        self.tracks.clear();
-        self.tracks_title = format!("Recherche « {q} »");
+        self.set_tracks(format!("Recherche « {q} »"), Vec::new(), View::Search);
         self.tracks_loading = true;
         self.focus = Focus::Tracks;
         thread::spawn(move || {
@@ -441,29 +622,90 @@ impl App {
 
     // ── Lecture ─────────────────────────────────────────────────────────────
 
+    /// Entrée sur une ligne du tableau : dépend de ce qui est affiché.
+    fn activate_track(&mut self, i: usize) {
+        let Some(&k) = self.view.get(i) else { return };
+        match self.shown {
+            // Dans la file : on y saute, sans la remplacer.
+            View::Queue => {
+                if self.queue.jump(k).is_some() {
+                    self.errors = 0;
+                    self.play_current();
+                }
+            }
+            // Résultat de recherche pendant une écoute : on le glisse dans la file actuelle.
+            View::Search if self.now.is_some() => {
+                let t = self.tracks[k].clone();
+                let at = self.queue.insert_next(t);
+                self.queue.jump(at);
+                self.play_current();
+            }
+            _ => self.play_from(i),
+        }
+    }
+
+    /// Joue la liste affichée (filtrée) à partir de la ligne `i` : elle devient la file.
     fn play_from(&mut self, i: usize) {
-        self.queue = Queue::new(self.tracks.clone(), i);
+        let list: Vec<Track> = self.view.iter().map(|&k| self.tracks[k].clone()).collect();
+        if i >= list.len() {
+            return;
+        }
+        self.queue = Queue::new(list, i);
+        self.queue_title = self.tracks_title.clone();
         self.errors = 0;
         self.play_current();
     }
 
     fn play_current(&mut self) {
+        self.report_stop();
         let Some(t) = self.queue.current().cloned() else { return };
-        let target = match &t.source {
-            Source::Local(p) => p.to_string_lossy().into_owned(),
-            Source::Jelly(id) => match self.jelly() {
-                Some(j) => j.stream_url(id),
-                None => return self.need_login(),
-            },
-        };
+        let Some(target) = self.target(&t) else { return self.need_login() };
         let Some(p) = self.player.as_mut() else {
             return self.flash("mpv n'est pas lancé : impossible de lire");
         };
         p.load(&target);
+        self.loaded = true;
+        self.set_now(t);
+        self.plan_upcoming();
+    }
+
+    fn set_now(&mut self, t: Track) {
         self.pos = 0.0;
         self.dur = t.duration.unwrap_or(0.0);
         self.paused = false;
         self.now = Some(t);
+        self.report(Report::Start);
+        self.refresh_queue_view();
+    }
+
+    /// Choisit le titre suivant et le confie à mpv, qui le précharge pour l'enchaîner sans blanc.
+    fn plan_upcoming(&mut self) {
+        let next = self.queue.plan(self.shuffle, &mut self.rng).cloned();
+        let target = next.as_ref().and_then(|t| self.target(t));
+        self.upcoming_sent = target.is_some();
+        if let Some(p) = self.player.as_mut() {
+            p.set_upcoming(target.as_deref());
+        }
+    }
+
+    /// Le morceau s'est terminé (ou n'a pas pu être lu) : mpv a déjà enchaîné si possible.
+    fn track_finished(&mut self) {
+        if self.now.is_none() {
+            return;
+        }
+        self.report_stop();
+        let gapless = self.upcoming_sent;
+        match self.queue.advance().cloned() {
+            Some(t) if gapless => {
+                if let Some(p) = self.player.as_mut() {
+                    p.drop_finished();
+                }
+                self.set_now(t);
+                self.plan_upcoming();
+            }
+            Some(_) => self.play_current(),
+            None => self.stop("Fin de la file de lecture"),
+        }
     }
 
     fn next(&mut self) {
@@ -478,13 +720,16 @@ impl App {
     }
 
     fn stop(&mut self, msg: &str) {
+        self.report_stop();
         if let Some(p) = self.player.as_mut() {
             p.stop();
         }
+        self.loaded = false;
         self.now = None;
         self.pos = 0.0;
         self.dur = 0.0;
         self.flash(msg);
+        self.refresh_queue_view();
     }
 
     fn prev(&mut self) {
@@ -501,7 +746,16 @@ impl App {
         if self.now.is_none() {
             // Rien en cours : Espace lance le titre sélectionné.
             if let Some(i) = self.table.selected() {
-                self.play_from(i);
+                self.activate_track(i);
+            }
+        } else if !self.loaded {
+            // Reprise de session sans fichier chargé (serveur absent au lancement).
+            if self.load_resumed() {
+                if let Some(p) = self.player.as_mut() {
+                    p.toggle_pause();
+                }
+            } else {
+                self.need_login();
             }
         } else if let Some(p) = self.player.as_mut() {
             p.toggle_pause();
@@ -522,17 +776,100 @@ impl App {
         }
     }
 
+    /// « a » : à la fin de la file ; « e » : juste après le titre en cours.
+    fn enqueue(&mut self, next: bool) {
+        let Some(t) = self.table.selected().and_then(|i| self.view_track(i)).cloned() else { return };
+        if self.shown == View::Queue {
+            return self.flash("Ce titre est déjà dans la file");
+        }
+        let title = t.title.clone();
+        if self.now.is_none() {
+            self.queue = Queue::new(vec![t], 0);
+            self.queue_title = "File d'attente".into();
+            self.errors = 0;
+            return self.play_current();
+        }
+        if next {
+            self.queue.insert_next(t);
+            self.flash(format!("Lu ensuite : {title}"));
+        } else {
+            self.queue.push(t);
+            self.flash(format!("Ajouté à la file : {title}"));
+        }
+        self.plan_upcoming();
+        self.refresh_queue_view();
+    }
+
+    /// Suppr dans la file : retire le titre (sauf celui en cours).
+    fn remove_from_queue(&mut self) {
+        if self.shown != View::Queue {
+            return;
+        }
+        let Some(&k) = self.table.selected().and_then(|i| self.view.get(i)) else { return };
+        if self.queue.remove(k).is_none() {
+            return self.flash("Impossible de retirer le titre en cours");
+        }
+        self.plan_upcoming();
+        self.refresh_queue_view();
+    }
+
+    fn toggle_shuffle(&mut self) {
+        self.shuffle = !self.shuffle;
+        self.flash(if self.shuffle { "Lecture aléatoire activée" } else { "Lecture aléatoire désactivée" });
+        if self.loaded {
+            self.plan_upcoming();
+        }
+    }
+
+    fn toggle_mobile(&mut self) {
+        self.cfg.mobile_quality = !self.cfg.mobile_quality;
+        let _ = self.cfg.save();
+        self.flash(if self.cfg.mobile_quality {
+            "Qualité mobile (Opus 128 kb/s) à partir du prochain titre"
+        } else {
+            "Qualité d'origine à partir du prochain titre"
+        });
+        if self.loaded {
+            self.plan_upcoming();
+        }
+    }
+
+    // ── Suivi des écoutes côté Jellyfin ─────────────────────────────────────
+
+    fn report(&mut self, step: Report) {
+        let id = match (step, &self.now) {
+            (Report::Start, Some(Track { source: Source::Jelly(id), .. })) => {
+                self.reported = Some(id.clone());
+                id.clone()
+            }
+            (Report::Start, _) => return,
+            _ => match &self.reported {
+                Some(id) => id.clone(),
+                None => return,
+            },
+        };
+        if step == Report::Stop {
+            self.reported = None;
+        }
+        self.last_report = Instant::now();
+        let Some(j) = self.jelly() else { return };
+        let (pos, paused, mobile) = (self.pos, self.paused, self.cfg.mobile_quality);
+        thread::spawn(move || {
+            let _ = j.report(step, &id, pos, paused, mobile);
+        });
+    }
+
+    fn report_stop(&mut self) {
+        self.report(Report::Stop);
+    }
+
     // ── Connexion ───────────────────────────────────────────────────────────
 
     /// Jellyfin a refusé le jeton : on l'oublie et on propose tout de suite de se reconnecter.
     fn session_expired(&mut self) {
         self.cfg.token.clear();
-        let ch = self.server_children();
-        if let Some(server) = self.tree.get_mut(1) {
-            server.children = Some(ch);
-            server.expanded = true;
-        }
-        self.rebuild_rows();
+        self.reported = None;
+        self.reset_server_node();
         self.tracks_loading = false;
         if matches!(self.mode, Mode::Login(_)) {
             return; // formulaire déjà ouvert : on ne perd pas la saisie en cours
@@ -583,21 +920,46 @@ impl App {
         });
     }
 
-    // ── Messages des fils d'arrière-plan ────────────────────────────────────
+    // ── Messages ────────────────────────────────────────────────────────────
 
-    pub fn on_msg(&mut self, msg: Msg) {
+    /// Traite un message. Vrai s'il faut redessiner l'écran.
+    pub fn on_msg(&mut self, msg: Msg) -> bool {
         match msg {
+            Msg::Input(Event::Key(k)) if k.kind == KeyEventKind::Press => self.on_key(k),
+            Msg::Input(Event::Mouse(m)) => {
+                // Les simples déplacements de la souris n'appellent aucun redessin.
+                if matches!(m.kind, MouseEventKind::Moved) {
+                    return false;
+                }
+                self.on_mouse(m);
+            }
+            Msg::Input(Event::Resize(..)) => {}
+            Msg::Input(_) => return false,
             Msg::Player(e) => match e {
                 player::Event::Time(t) => {
+                    // L'affichage est à la seconde : inutile de redessiner entre deux.
+                    let changed = t as u64 != self.pos as u64;
                     self.pos = t;
                     if t > 0.5 {
                         self.errors = 0;
                     }
+                    return changed;
                 }
                 player::Event::Duration(d) => self.dur = d,
-                player::Event::Pause(p) => self.paused = p,
+                player::Event::Pause(p) => {
+                    let was = self.paused;
+                    self.paused = p;
+                    if was != p && self.now.is_some() {
+                        // Première reprise après une session restaurée : on signale le début.
+                        if self.reported.is_none() && !p {
+                            self.report(Report::Start);
+                        } else {
+                            self.report(Report::Progress);
+                        }
+                    }
+                }
                 player::Event::Volume(v) => self.volume = v,
-                player::Event::Eof => self.next(),
+                player::Event::Eof => self.track_finished(),
                 player::Event::Error(e) => {
                     self.errors += 1;
                     if self.errors >= 3 {
@@ -605,7 +967,7 @@ impl App {
                         self.stop(&format!("3 titres illisibles d'affilée, lecture arrêtée ({e})"));
                     } else {
                         self.flash(format!("Lecture impossible : {e}"));
-                        self.next();
+                        self.track_finished();
                     }
                 }
             },
@@ -635,10 +997,13 @@ impl App {
             }
             Msg::Tracks { req, title, result } => {
                 if req != self.req {
-                    return; // une demande plus récente a pris le relais
+                    return false; // une demande plus récente a pris le relais
                 }
                 match result {
-                    Ok(t) => self.set_tracks(title, t),
+                    Ok(t) => {
+                        let shown = self.shown;
+                        self.set_tracks(title, t, shown);
+                    }
                     Err(e) => {
                         self.tracks_loading = false;
                         self.api_error(e);
@@ -646,7 +1011,7 @@ impl App {
                 }
             }
             Msg::Login(result) => {
-                let Mode::Login(f) = &mut self.mode else { return };
+                let Mode::Login(f) = &mut self.mode else { return false };
                 match result {
                     Ok((token, id)) => {
                         self.cfg.jellyfin_url = f.url.trim().to_string();
@@ -654,12 +1019,7 @@ impl App {
                         self.cfg.token = token;
                         self.cfg.user_id = id;
                         self.mode = Mode::Normal;
-                        let ch = self.server_children();
-                        if let Some(server) = self.tree.get_mut(1) {
-                            server.children = Some(ch);
-                            server.expanded = true;
-                        }
-                        self.rebuild_rows();
+                        self.reset_server_node();
                         match self.cfg.save() {
                             Ok(()) => self.flash("Connecté à Jellyfin"),
                             Err(e) => self.flash(format!("Connecté, mais config non enregistrée : {e}")),
@@ -672,6 +1032,7 @@ impl App {
                 }
             }
         }
+        true
     }
 
     // ── Clavier ─────────────────────────────────────────────────────────────
@@ -684,6 +1045,7 @@ impl App {
         match self.mode {
             Mode::Login(_) => return self.key_login(k),
             Mode::Search(_) => return self.key_search(k),
+            Mode::Filter => return self.key_filter(k),
             Mode::Normal => {}
         }
         match k.code {
@@ -695,11 +1057,13 @@ impl App {
             KeyCode::Char('.') => self.seek(10.0),
             KeyCode::Char('+') | KeyCode::Char('=') => self.add_volume(5.0),
             KeyCode::Char('-') => self.add_volume(-5.0),
-            KeyCode::Char('s') => {
-                self.shuffle = !self.shuffle;
-                self.flash(if self.shuffle { "Lecture aléatoire activée" } else { "Lecture aléatoire désactivée" });
-            }
+            KeyCode::Char('s') => self.toggle_shuffle(),
+            KeyCode::Char('m') => self.toggle_mobile(),
             KeyCode::Char('/') => self.mode = Mode::Search(String::new()),
+            KeyCode::Char('f') => {
+                self.mode = Mode::Filter;
+                self.focus = Focus::Tracks;
+            }
             KeyCode::Char('c') => self.open_login(),
             KeyCode::Tab => {
                 self.focus = match self.focus {
@@ -758,7 +1122,7 @@ impl App {
     }
 
     fn key_tracks(&mut self, code: KeyCode) {
-        let len = self.tracks.len();
+        let len = self.view.len();
         let sel = self.table.selected();
         match code {
             KeyCode::Up => self.table.select(step(sel, len, -1)),
@@ -769,8 +1133,15 @@ impl App {
             KeyCode::End => self.table.select(step(Some(len), len, 0)),
             KeyCode::Enter => {
                 if let Some(i) = sel {
-                    self.play_from(i);
+                    self.activate_track(i);
                 }
+            }
+            KeyCode::Char('a') => self.enqueue(false),
+            KeyCode::Char('e') => self.enqueue(true),
+            KeyCode::Delete | KeyCode::Char('x') => self.remove_from_queue(),
+            KeyCode::Esc if !self.filter.is_empty() => {
+                self.filter.clear();
+                self.apply_filter();
             }
             KeyCode::Left => self.focus = Focus::Sidebar,
             _ => {}
@@ -830,6 +1201,29 @@ impl App {
         }
     }
 
+    /// Filtre au fil de la frappe ; Entrée le garde, Échap l'efface.
+    fn key_filter(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Esc => {
+                self.filter.clear();
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                return;
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+            }
+            KeyCode::Char(c) => self.filter.push(c),
+            KeyCode::Up | KeyCode::Down => {
+                return self.key_tracks(k.code);
+            }
+            _ => return,
+        }
+        self.apply_filter();
+    }
+
     // ── Souris ──────────────────────────────────────────────────────────────
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
@@ -843,7 +1237,7 @@ impl App {
                 if self.area_side.contains(pos) {
                     self.side.select(step(self.side.selected(), self.rows.len(), d));
                 } else if self.area_tracks.contains(pos) {
-                    self.table.select(step(self.table.selected(), self.tracks.len(), d));
+                    self.table.select(step(self.table.selected(), self.view.len(), d));
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -862,9 +1256,9 @@ impl App {
                 } else if self.area_tracks.contains(pos) {
                     self.focus = Focus::Tracks;
                     // +2 : bordure du haut et ligne d'en-tête.
-                    if let Some(i) = row_at(self.area_tracks, m.row, 2, self.table.offset(), self.tracks.len()) {
+                    if let Some(i) = row_at(self.area_tracks, m.row, 2, self.table.offset(), self.view.len()) {
                         self.table.select(Some(i));
-                        self.play_from(i);
+                        self.activate_track(i);
                     }
                 } else if self.area_player.contains(pos) {
                     self.focus = Focus::Player;
@@ -934,8 +1328,8 @@ mod tests {
 
     #[test]
     fn arbre_selon_la_connexion() {
-        assert_eq!(labels(&app(false).0), ["Ce PC", "Jellyfin", "Se connecter…"]);
-        assert_eq!(labels(&app(true).0), ["Ce PC", "Jellyfin", "Playlists", "Artistes", "Albums"]);
+        assert_eq!(labels(&app(false).0), ["File d'attente", "Ce PC", "Jellyfin", "Se connecter…"]);
+        assert_eq!(labels(&app(true).0), ["File d'attente", "Ce PC", "Jellyfin", "Playlists", "Artistes", "Albums"]);
     }
 
     #[test]
@@ -947,7 +1341,7 @@ mod tests {
 
         assert!(a.cfg.token.is_empty(), "le jeton refusé est oublié");
         assert!(!a.tracks_loading);
-        assert_eq!(labels(&a)[2], "Se connecter…");
+        assert_eq!(labels(&a)[3], "Se connecter…");
         let f = login_form(&a);
         assert_eq!((f.user.as_str(), f.field), ("moi", 2), "curseur directement sur le mot de passe");
         assert!(f.error.as_deref().unwrap().contains("Session expirée"));
@@ -974,7 +1368,7 @@ mod tests {
 
         assert!(matches!(a.mode, Mode::Normal));
         assert_eq!((a.cfg.token.as_str(), a.cfg.user_id.as_str()), ("nouveau", "u2"));
-        assert_eq!(labels(&a)[2..], ["Playlists", "Artistes", "Albums"]);
+        assert_eq!(labels(&a)[3..], ["Playlists", "Artistes", "Albums"]);
         assert_eq!(Config::load_from(&a.cfg.file).token, "nouveau", "la nouvelle session est enregistrée");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1021,27 +1415,38 @@ mod tests {
     #[test]
     fn enfants_charges_puis_resultat_perime_ignore() {
         let (mut a, _) = app(true);
-        let playlists = [1, 0];
+        let playlists = [2, 0];
         a.node_mut(&playlists).unwrap().loading = true;
         a.node_mut(&playlists).unwrap().expanded = true;
         let pl = |n: &str| Node::new(n, Kind::Playlist(n.into()));
         a.on_msg(Msg::Children { path: playlists.to_vec(), result: Ok(vec![pl("B.Rap"), pl("Chill")]) });
-        assert_eq!(labels(&a)[3..5], ["B.Rap", "Chill"]);
+        assert_eq!(labels(&a)[4..6], ["B.Rap", "Chill"]);
 
         // Pendant un chargement, la session expire et l'arbre est reconstruit :
         // le même chemin désigne désormais « Se connecter… ».
-        a.node_mut(&[1, 1]).unwrap().loading = true;
+        a.node_mut(&[2, 1]).unwrap().loading = true;
         a.session_expired();
-        a.on_msg(Msg::Children { path: vec![1, 0], result: Ok(vec![pl("intrus")]) });
-        assert!(a.node(&[1, 0]).unwrap().children.is_none());
-        assert_eq!(labels(&a), ["Ce PC", "Jellyfin", "Se connecter…"]);
+        a.on_msg(Msg::Children { path: vec![2, 0], result: Ok(vec![pl("intrus")]) });
+        assert!(a.node(&[2, 0]).unwrap().children.is_none());
+        assert_eq!(labels(&a), ["File d'attente", "Ce PC", "Jellyfin", "Se connecter…"]);
+    }
+
+    /// Une file de 10 titres locaux, le premier « en cours », le suivant prévu.
+    fn en_lecture(a: &mut App) {
+        a.queue = Queue::new((0..10).map(|i| track(&i.to_string())).collect(), 0);
+        a.now = Some(track("0"));
+        a.loaded = true;
+        a.plan_upcoming();
+    }
+
+    fn now(a: &App) -> &str {
+        a.now.as_ref().map(|t| t.title.as_str()).unwrap_or("-")
     }
 
     #[test]
     fn trois_titres_illisibles_arretent_la_lecture() {
         let (mut a, _) = app(false);
-        a.queue = Queue::new((0..10).map(|i| track(&i.to_string())).collect(), 0);
-        a.now = Some(track("0"));
+        en_lecture(&mut a);
         for _ in 0..2 {
             a.on_msg(Msg::Player(player::Event::Error("fichier absent".into())));
             assert!(a.now.is_some());
@@ -1054,8 +1459,7 @@ mod tests {
     #[test]
     fn une_lecture_reussie_remet_le_compteur_a_zero() {
         let (mut a, _) = app(false);
-        a.queue = Queue::new((0..10).map(|i| track(&i.to_string())).collect(), 0);
-        a.now = Some(track("0"));
+        en_lecture(&mut a);
         a.on_msg(Msg::Player(player::Event::Error("x".into())));
         a.on_msg(Msg::Player(player::Event::Error("x".into())));
         a.on_msg(Msg::Player(player::Event::Time(12.0)));
@@ -1081,5 +1485,176 @@ mod tests {
         assert_eq!(row_at(zone, 17, 1, 0, 50), None, "bordure du bas");
         assert_eq!(row_at(zone, 12, 2, 0, 50), Some(0), "ligne d'en-tête du tableau");
         assert_eq!(row_at(zone, 15, 1, 0, 3), None, "sous le dernier élément");
+    }
+
+    #[test]
+    fn enchainement_sur_le_titre_precharge_puis_fin_de_file() {
+        let (mut a, _) = app(false);
+        en_lecture(&mut a);
+        assert!(a.upcoming_sent, "le suivant est confié à mpv à l'avance");
+        a.on_msg(Msg::Player(player::Event::Eof));
+        assert_eq!(now(&a), "1");
+        a.on_msg(Msg::Player(player::Event::Eof));
+        assert_eq!(now(&a), "2");
+        for _ in 2..9 {
+            a.on_msg(Msg::Player(player::Event::Eof));
+        }
+        assert_eq!(now(&a), "9");
+        assert!(!a.upcoming_sent, "plus rien après le dernier");
+        a.on_msg(Msg::Player(player::Event::Eof));
+        assert_eq!(now(&a), "-");
+        assert!(a.status.as_ref().unwrap().0.contains("Fin de la file"));
+    }
+
+    #[test]
+    fn filtre_au_fil_de_la_frappe() {
+        let (mut a, _) = app(false);
+        let mut t = vec![track("Tchikita"), track("Bande organisée"), track("Tout va bien")];
+        t[1].artist = "Jul".into();
+        a.set_tracks("B.Rap".into(), t, View::List);
+        let touche = |a: &mut App, c: KeyCode| a.on_key(KeyEvent::from(c));
+        touche(&mut a, KeyCode::Char('f'));
+        for c in "jul".chars() {
+            touche(&mut a, KeyCode::Char(c));
+        }
+        assert_eq!(a.view, [1], "l'artiste compte aussi, sans tenir compte des majuscules");
+        touche(&mut a, KeyCode::Backspace);
+        touche(&mut a, KeyCode::Backspace);
+        touche(&mut a, KeyCode::Backspace);
+        touche(&mut a, KeyCode::Char('t'));
+        assert_eq!(a.view, [0, 2]);
+        touche(&mut a, KeyCode::Enter);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(a.filter, "t", "Entrée garde le filtre");
+        // Lire depuis la liste filtrée : la file ne contient que ce qui est visible.
+        a.play_from(1);
+        assert_eq!(a.queue.items().iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["Tchikita", "Tout va bien"]);
+        assert_eq!(a.queue.index(), 1);
+        touche(&mut a, KeyCode::Char('f'));
+        touche(&mut a, KeyCode::Esc);
+        assert_eq!(a.view, [0, 1, 2], "Échap efface le filtre");
+    }
+
+    #[test]
+    fn ajouter_et_lire_ensuite() {
+        let (mut a, _) = app(false);
+        en_lecture(&mut a);
+        a.set_tracks("Album".into(), vec![track("A"), track("B")], View::List);
+        a.focus = Focus::Tracks;
+        a.table.select(Some(0));
+        a.on_key(KeyEvent::from(KeyCode::Char('a')));
+        a.table.select(Some(1));
+        a.on_key(KeyEvent::from(KeyCode::Char('e')));
+        let titres: Vec<&str> = a.queue.items().iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titres[..2], ["0", "B"], "« e » : juste après le titre en cours");
+        assert_eq!(titres.last(), Some(&"A"), "« a » : en fin de file");
+        assert_eq!(a.queue.planned().unwrap().title, "B", "le préchargé suit la file modifiée");
+        a.on_msg(Msg::Player(player::Event::Eof));
+        assert_eq!(now(&a), "B");
+    }
+
+    #[test]
+    fn la_file_d_attente_se_consulte_et_se_modifie() {
+        let (mut a, _) = app(false);
+        en_lecture(&mut a);
+        a.show_queue();
+        assert_eq!((a.shown, a.tracks.len(), a.table.selected()), (View::Queue, 10, Some(0)));
+        a.focus = Focus::Tracks;
+        a.table.select(Some(4));
+        a.on_key(KeyEvent::from(KeyCode::Delete));
+        assert_eq!(a.queue_len(), 9);
+        assert_eq!(a.tracks.len(), 9, "l'affichage suit");
+        assert!(a.tracks.iter().all(|t| t.title != "4"));
+        a.table.select(Some(0));
+        a.remove_from_queue();
+        assert!(a.status.as_ref().unwrap().0.contains("en cours"));
+        // Entrée dans la file : on saute au titre sans remplacer la file.
+        a.table.select(Some(6));
+        a.activate_track(6);
+        assert_eq!(a.queue.index(), 6);
+        assert_eq!(a.queue_len(), 9);
+    }
+
+    #[test]
+    fn un_resultat_de_recherche_se_glisse_dans_la_file() {
+        let (mut a, _) = app(false);
+        en_lecture(&mut a);
+        a.set_tracks("Recherche « x »".into(), vec![track("trouvé")], View::Search);
+        a.activate_track(0);
+        assert_eq!(a.queue_len(), 11, "la file d'origine est gardée");
+        assert_eq!(a.queue.current().unwrap().title, "trouvé");
+        assert_eq!(a.queue.items()[2].title, "1", "le reste de la file suit");
+    }
+
+    #[test]
+    fn reprise_de_session() {
+        let (mut a, _) = app(false);
+        let dir = std::env::temp_dir().join(format!("musiq-session-{}", std::process::id()));
+        a.session_file = dir.join("session.json");
+        en_lecture(&mut a);
+        a.queue.jump(3);
+        a.queue_title = "B.Rap".into();
+        a.pos = 83.0;
+        a.shutdown();
+
+        let (mut b, _) = app(false);
+        b.session_file = a.session_file.clone();
+        b.resume();
+        assert_eq!((now(&b), b.pos, b.paused), ("3", 83.0, true));
+        assert_eq!((b.shown, b.queue_len(), b.queue_title.as_str()), (View::Queue, 10, "B.Rap"));
+        assert!(!b.loaded, "sans mpv, rien n'est chargé : Espace rechargera");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn aucun_reveil_ni_redessin_en_pause() {
+        let (mut a, _) = app(false);
+        assert_eq!(a.deadline(), None, "à l'arrêt : on attend sans rien faire");
+        en_lecture(&mut a);
+        assert!(a.deadline().unwrap() <= Duration::from_secs_f64(SECTOR_STEP), "en lecture : l'animation");
+        a.paused = true;
+        assert_eq!(a.deadline(), None);
+        assert!(!a.tick());
+        a.flash("message");
+        assert!(a.deadline().unwrap() <= STATUS_LIFE, "un message doit s'effacer à temps");
+    }
+
+    #[test]
+    fn redessin_seulement_quand_l_affichage_change() {
+        let (mut a, _) = app(false);
+        en_lecture(&mut a);
+        assert!(a.on_msg(Msg::Player(player::Event::Time(1.2))));
+        assert!(!a.on_msg(Msg::Player(player::Event::Time(1.7))), "même seconde affichée");
+        assert!(a.on_msg(Msg::Player(player::Event::Time(2.0))));
+        let bouge = MouseEvent { kind: MouseEventKind::Moved, column: 3, row: 3, modifiers: KeyModifiers::NONE };
+        assert!(!a.on_msg(Msg::Input(Event::Mouse(bouge))));
+        assert!(a.on_msg(Msg::Input(Event::Resize(80, 24))));
+    }
+
+    #[test]
+    fn suivi_des_ecoutes_seulement_pour_jellyfin() {
+        let (mut a, _) = app(true);
+        a.set_now(track("local"));
+        assert_eq!(a.reported, None);
+        let mut t = track("serveur");
+        t.source = Source::Jelly("t1".into());
+        a.set_now(t);
+        assert_eq!(a.reported.as_deref(), Some("t1"));
+        a.report_stop();
+        assert_eq!(a.reported, None);
+    }
+
+    #[test]
+    fn qualite_mobile_et_aleatoire_se_basculent() {
+        let (mut a, _) = app(true);
+        a.on_key(KeyEvent::from(KeyCode::Char('m')));
+        assert!(a.cfg.mobile_quality);
+        let mut t = track("x");
+        t.source = Source::Jelly("t1".into());
+        assert!(a.target(&t).unwrap().contains("AudioCodec=opus"));
+        a.on_key(KeyEvent::from(KeyCode::Char('m')));
+        assert!(a.target(&t).unwrap().contains("static=true"));
+        a.on_key(KeyEvent::from(KeyCode::Char('s')));
+        assert!(a.shuffle);
     }
 }

@@ -1,0 +1,31 @@
+# Publie un binaire prêt à l'emploi à chaque étiquette vX.Y.Z.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    # Ubuntu 22.04 : glibc assez ancienne pour que le binaire tourne sur les
+    # distributions récentes (Fedora, Debian, Arch…).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Archive
+        run: |
+          name=musiq-${GITHUB_REF_NAME}-linux-x86_64
+          mkdir "$name"
+          cp target/release/musiq README.md "$name"/
+          cp -r packaging "$name"/
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            musiq-*.tar.gz
+            musiq-*.tar.gz.sha256
+          generate_release_notes: true

@@ -1,6 +1,10 @@
 //! Musique stockée sur le PC : simple parcours de dossiers, sans base de données.
+//! Les tags (titre, artiste, album, durée, piste) sont lus à l'ouverture d'un
+//! dossier ; les noms de dossiers servent de secours.
 
 use crate::model::{Source, Track};
+use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::tag::Accessor;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -33,7 +37,12 @@ pub fn list(root: &Path, dir: &Path) -> (Vec<PathBuf>, Vec<Track>) {
     }
     dirs.sort();
     files.sort();
-    (dirs, files.iter().map(|f| track(root, f)).collect())
+    // Ordre des pistes (disque, numéro) quand les tags le donnent, sinon par nom.
+    let mut tracks: Vec<(Option<(u32, u32)>, Track)> = files.iter().map(|f| tagged(root, f)).collect();
+    if tracks.iter().all(|(n, _)| n.is_some()) {
+        tracks.sort_by_key(|(n, _)| *n);
+    }
+    (dirs, tracks.into_iter().map(|(_, t)| t).collect())
 }
 
 /// Recherche par nom de fichier (chemin complet) dans tous les dossiers locaux.
@@ -51,7 +60,7 @@ pub fn search(roots: &[PathBuf], query: &str, limit: usize) -> Vec<Track> {
                 } else if is_audio(&p)
                     && p.strip_prefix(root).unwrap_or(&p).to_string_lossy().to_lowercase().contains(&q)
                 {
-                    out.push(track(root, &p));
+                    out.push(tagged(root, &p).1);
                     if out.len() >= limit {
                         return out;
                     }
@@ -60,6 +69,27 @@ pub fn search(roots: &[PathBuf], query: &str, limit: usize) -> Vec<Track> {
         }
     }
     out
+}
+
+/// Morceau décrit par ses tags, complétés par `track` pour ce qui manque.
+/// Renvoie aussi (disque, piste) si le numéro de piste est connu.
+fn tagged(root: &Path, file: &Path) -> (Option<(u32, u32)>, Track) {
+    let mut t = track(root, file);
+    let Ok(f) = lofty::read_from_path(file) else { return (None, t) };
+    let d = f.properties().duration().as_secs_f64();
+    if d > 0.0 {
+        t.duration = Some(d);
+    }
+    let Some(tag) = f.primary_tag().or_else(|| f.first_tag()) else { return (None, t) };
+    let set = |field: &mut String, v: Option<std::borrow::Cow<str>>| {
+        if let Some(v) = v.filter(|v| !v.trim().is_empty()) {
+            *field = v.trim().to_string();
+        }
+    };
+    set(&mut t.title, tag.title());
+    set(&mut t.artist, tag.artist());
+    set(&mut t.album, tag.album());
+    (tag.track().map(|n| (tag.disk().unwrap_or(1), n)), t)
 }
 
 /// Titre = nom du fichier ; pour une arborescence Artiste/Album/morceau,

@@ -12,6 +12,22 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .into()
 });
 
+/// Les remontées d'écoute ne doivent jamais faire attendre : délai court.
+static REPORT_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(3)))
+        .build()
+        .into()
+});
+
+/// Étape d'écoute signalée à Jellyfin (compteurs de lecture, « en cours »).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Report {
+    Start,
+    Progress,
+    Stop,
+}
+
 #[derive(Clone)]
 pub struct Jellyfin {
     pub url: String,
@@ -172,9 +188,42 @@ impl Jellyfin {
         ))
     }
 
-    /// Fichier d'origine, sans transcodage (FLAC compris) : pensé pour un réseau local.
-    pub fn stream_url(&self, id: &str) -> String {
-        format!("{}/Audio/{id}/stream?static=true&api_key={}", self.base(), self.token)
+    /// Fichier d'origine, sans transcodage (FLAC compris) : pensé pour un réseau
+    /// local. En qualité mobile, le serveur convertit en Opus 128 kb/s.
+    pub fn stream_url(&self, id: &str, mobile: bool) -> String {
+        if mobile {
+            format!(
+                "{}/Audio/{id}/universal?UserId={}&DeviceId={}&api_key={}&MaxStreamingBitrate=128000\
+                 &Container=opus,ogg|opus,webm|opus&TranscodingContainer=ogg&TranscodingProtocol=http&AudioCodec=opus",
+                self.base(),
+                self.user_id,
+                self.device_id,
+                self.token
+            )
+        } else {
+            format!("{}/Audio/{id}/stream?static=true&api_key={}", self.base(), self.token)
+        }
+    }
+
+    /// Signale une étape d'écoute. Échec sans conséquence : ce n'est que du suivi.
+    pub fn report(&self, step: Report, id: &str, pos: f64, paused: bool, mobile: bool) -> ApiResult<()> {
+        let path = match step {
+            Report::Start => "/Sessions/Playing",
+            Report::Progress => "/Sessions/Playing/Progress",
+            Report::Stop => "/Sessions/Playing/Stopped",
+        };
+        REPORT_AGENT
+            .post(format!("{}{}", self.base(), path))
+            .header("Authorization", auth_header(&self.device_id, Some(&self.token)))
+            .send_json(json!({
+                "ItemId": id,
+                "PositionTicks": (pos.max(0.0) * 10_000_000.0) as i64,
+                "IsPaused": paused,
+                "CanSeek": true,
+                "PlayMethod": if mobile { "Transcode" } else { "DirectPlay" },
+            }))
+            .map_err(err)?;
+        Ok(())
     }
 }
 
@@ -343,8 +392,30 @@ mod tests {
     #[test]
     fn adresse_du_flux() {
         assert_eq!(
-            client("http://srv:8096/").stream_url("t1"),
+            client("http://srv:8096/").stream_url("t1", false),
             "http://srv:8096/Audio/t1/stream?static=true&api_key=JETON"
         );
+        let mobile = client("http://srv:8096").stream_url("t1", true);
+        assert!(mobile.starts_with("http://srv:8096/Audio/t1/universal?UserId=U1&DeviceId=D1&api_key=JETON"));
+        assert!(mobile.contains("MaxStreamingBitrate=128000") && mobile.contains("AudioCodec=opus"));
+        assert!(!mobile.contains(' '), "pas d'espace dans l'adresse");
+    }
+
+    #[test]
+    fn remontee_des_ecoutes() {
+        let (url, log) = fake(vec![("/Sessions/Playing", 204, "")]);
+        let c = client(&url);
+        c.report(Report::Start, "t1", 0.0, false, false).unwrap();
+        c.report(Report::Progress, "t1", 12.5, true, false).unwrap();
+        c.report(Report::Stop, "t1", 200.0, false, true).unwrap();
+        let log = log.lock().unwrap();
+        let chemins: Vec<&str> = log.iter().map(|r| r.split_whitespace().nth(1).unwrap()).collect();
+        assert_eq!(chemins, ["/Sessions/Playing", "/Sessions/Playing/Progress", "/Sessions/Playing/Stopped"]);
+        let body = |i: usize| -> Value { serde_json::from_str(log[i].split("\r\n\r\n").nth(1).unwrap()).unwrap() };
+        assert_eq!(body(1)["PositionTicks"], 125_000_000);
+        assert_eq!(body(1)["IsPaused"], true);
+        assert_eq!(body(0)["PlayMethod"], "DirectPlay");
+        assert_eq!(body(2)["PlayMethod"], "Transcode");
+        assert!(log[0].contains(r#"Token="JETON""#));
     }
 }

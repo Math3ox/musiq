@@ -20,6 +20,19 @@ pub enum Event {
     Error(String),
 }
 
+/// Module MPRIS de mpv (paquet `mpv-mpris`) : touches multimédia, widget audio
+/// du bureau, écran de verrouillage. Facultatif.
+const MPRIS: &[&str] = &[
+    "/usr/lib64/mpv/mpris.so",
+    "/usr/lib/mpv/mpris.so",
+    "/etc/mpv/scripts/mpris.so",
+    "/usr/lib/x86_64-linux-gnu/mpv/mpris.so",
+];
+
+pub fn mpris_plugin() -> Option<&'static str> {
+    MPRIS.iter().copied().find(|p| std::path::Path::new(p).exists())
+}
+
 pub struct Player {
     child: Child,
     stream: UnixStream,
@@ -27,21 +40,57 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn start<M: From<Event> + Send + 'static>(tx: Sender<M>, volume: f64) -> Result<Player, String> {
+    /// `replaygain` : "track", "album" ou "no".
+    pub fn start<M: From<Event> + Send + 'static>(
+        tx: Sender<M>,
+        volume: f64,
+        replaygain: &str,
+    ) -> Result<Player, String> {
         let dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let sock = dir.join(format!("musiq-mpv-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
+        let mut args: Vec<String> = [
+            "--idle=yes",
+            "--no-terminal",
+            "--no-config",
+            // Rien que du son : ni vidéo, ni pochette, ni fenêtre.
+            "--vid=no",
+            "--audio-display=no",
+            // Modules intégrés inutiles ici (interface à l'écran, YouTube,
+            // console, statistiques…) : autant de mémoire économisée.
+            "--osc=no",
+            "--ytdl=no",
+            "--load-scripts=no",
+            "--load-stats-overlay=no",
+            "--load-console=no",
+            "--load-auto-profiles=no",
+            "--load-select=no",
+            "--load-commands=no",
+            "--load-positioning=no",
+            "--load-context-menu=no",
+            "--input-default-bindings=no",
+            "--input-vo-keyboard=no",
+            // Tampon réseau plafonné : par défaut, mpv peut garder des dizaines
+            // de Mo d'un FLAC en streaming. 4 Mo = une bonne vingtaine de secondes.
+            "--cache=yes",
+            "--demuxer-max-bytes=4MiB",
+            "--demuxer-max-back-bytes=512KiB",
+            // Enchaînement sans blanc : le titre suivant est préchargé.
+            "--gapless-audio=yes",
+            "--prefetch-playlist=yes",
+        ]
+        .map(String::from)
+        .into();
+        args.push(format!("--replaygain={replaygain}"));
+        args.push(format!("--input-ipc-server={}", sock.display()));
+        args.push(format!("--volume={volume}"));
+        if let Some(so) = mpris_plugin() {
+            args.push(format!("--script={so}"));
+        }
         let child = Command::new("mpv")
-            .args([
-                "--idle=yes",
-                "--no-video",
-                "--no-terminal",
-                "--no-config",
-                &format!("--input-ipc-server={}", sock.display()),
-                &format!("--volume={volume}"),
-            ])
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -73,9 +122,31 @@ impl Player {
         let _ = writeln!(self.stream, "{}", json!({ "command": c }));
     }
 
+    /// Joue `target` tout de suite, à la place de tout le reste.
     pub fn load(&mut self, target: &str) {
         self.cmd(json!(["loadfile", target, "replace"]));
+        self.cmd(json!(["playlist-clear"]));
         self.cmd(json!(["set_property", "pause", false]));
+    }
+
+    /// Charge `target` en pause, positionné à `start` secondes (reprise de session).
+    pub fn load_paused(&mut self, target: &str, start: f64) {
+        self.cmd(json!(["set_property", "pause", true]));
+        self.cmd(json!(["loadfile", target, "replace", -1, format!("start={start:.1}")]));
+        self.cmd(json!(["playlist-clear"]));
+    }
+
+    /// Remplace le titre préchargé par `target` (None : plus rien après le courant).
+    pub fn set_upcoming(&mut self, target: Option<&str>) {
+        self.cmd(json!(["playlist-clear"]));
+        if let Some(t) = target {
+            self.cmd(json!(["loadfile", t, "append"]));
+        }
+    }
+
+    /// mpv vient d'enchaîner sur le titre préchargé : on oublie celui d'avant.
+    pub fn drop_finished(&mut self) {
+        self.cmd(json!(["playlist-remove", 0]));
     }
 
     pub fn toggle_pause(&mut self) {
